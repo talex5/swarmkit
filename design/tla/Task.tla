@@ -163,7 +163,7 @@ TypeOK ==
    and create a new model using the menu.
 
    You will be prompted to enter values for the various CONSTANTS.
-   A suitable set of inital values is:
+   A suitable set of initial values is:
 
    `.
    Node          <- [ model value ] {n1}
@@ -719,7 +719,7 @@ OrchestratorPreservesState ==
 
 \* A temporal formula that checks transitions
 TransitionsOK ==
-  /\ [][TransitionOK]_vars      \* Every step satifies TransitionOK (or leaves `vars' unchanged)
+  /\ [][TransitionOK]_vars      \* Every step satisfies TransitionOK (or leaves `vars' unchanged)
   /\ [][OrchestratorPreservesState]_vars
 
 (* Every service has the right number of running tasks (the system is in the desired state). *)
