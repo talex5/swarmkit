@@ -128,6 +128,7 @@ TaskStatus == [
 
    XXX: can desired_state be any state, or just some (e.g. {ready, running, shutdown, remove})? *)
 Task == [
+  id : TaskId,                      \* To uniquely identify this task
   service : ServiceId,              \* The service that owns the task
   status : TaskStatus,              \* The current state
   desired_state : TaskState,        \* The state requested by the orchestrator
@@ -135,19 +136,20 @@ Task == [
   slot : Slot \union {global}       \* A way of tracking related tasks
 ]
 
-VARIABLE tasks          \* A map of currently-allocated tasks, indexed by TaskId
+VARIABLE tasks          \* The set of currently-allocated tasks
 VARIABLE services       \* A map of currently-allocated services, indexed by ServiceId
 
-(* The current state of task "id". *)
-State(id) ==
-  tasks[id].status.state
+(* The current state of task `t'. *)
+State(t) == t.status.state
+
+(* A task is runnable if it is running or could become running in the future. *)
+Runnable(t) == State(t) \preceq running
 
 (* The expected type of each variable. TLA+ is an untyped language, but the model checker
    can check that TypeOK is true for every reachable state. *)
 TypeOK ==
-  \* `tasks' is a mapping from task IDs to Tasks:
-  /\ DOMAIN tasks \subseteq TaskId
-  /\ tasks \in [ DOMAIN tasks -> Task ]
+  \* `tasks' is a subset of the set of all possible tasks
+  /\ tasks \in SUBSET Task
   \* `services' is a mapping from service IDs to ServiceSpecs:
   /\ DOMAIN services \subseteq ServiceId
   /\ services \in [ DOMAIN services -> ServiceSpec ]
@@ -279,22 +281,20 @@ IsReplicated(sid) ==
 IsGlobal(sid) ==
   services[sid].replicas = global
 
-(* TasksOf(sid) is the set of task IDs for service `sid'. *)
+(* TasksOf(sid) is the set of tasks for service `sid'. *)
 TasksOf(sid) ==
-  { i \in DOMAIN tasks : tasks[i].service = sid }
+  { t \in tasks : t.service = sid }
 
 (* A task's ``virtual slot'' is its actual slot for replicated services,
    but its node for global ones. *)
-VSlot(id) ==
-  IF IsReplicated(tasks[id].service)
-    THEN tasks[id].slot
-    ELSE tasks[id].node
+VSlot(t) ==
+  IF IsReplicated(t.service)
+    THEN t.slot
+    ELSE t.node
 
 (* All tasks of service `sid' in `vslot'. *)
 TasksOfVSlot(sid, vslot) ==
-  IF IsReplicated(sid)
-    THEN { i \in TasksOf(sid) : tasks[i].slot = vslot }
-    ELSE { i \in TasksOf(sid) : tasks[i].node = vslot }
+  { t \in TasksOf(sid) : VSlot(t) = vslot }
 
 (* All vslots of service `sid'. *)
 VSlotsOf(sid) ==
@@ -303,16 +303,17 @@ VSlotsOf(sid) ==
 (* The set of tasks for service `sid' that should be considered as active.
    This is any task that is running or on its way to running. *)
 RunnableTasks(sid) ==
-  { i \in TasksOf(sid) : State(i) \preceq running }
+  { t \in TasksOf(sid) : Runnable(t) }
 
 (* Candidates for shutting down when we have too many. We don't want to count tasks that are shutting down
    towards the total count when deciding whether we need to kill anything. *)
 RunnableWantedTasks(sid) ==
-  { i \in RunnableTasks(sid) : tasks[i].desired_state \preceq running  }
+  { t \in RunnableTasks(sid) : t.desired_state \preceq running  }
 
-(* A `new' task belonging to service `sid' with the given slot and desired state. *)
-NewTask(sid, vslot, desired_state) ==
+(* A `new' task belonging to service `sid' with the given slot, id, and desired state. *)
+NewTask(sid, vslot, id, desired_state) ==
   [
+    id            |-> id,
     service       |-> sid,
     status        |-> [ state |-> new ],
     desired_state |-> desired_state,
@@ -320,21 +321,44 @@ NewTask(sid, vslot, desired_state) ==
     slot          |-> IF IsGlobal(sid)     THEN global     ELSE vslot
   ]
 
+(* Update tasks by performing each update in `f', which is a function
+   mapping old tasks to new ones. *)
+UpdateTasks(f) ==
+  /\ Assert(\A t \in DOMAIN f : t \in tasks, "An old task does not exist!")
+  /\ Assert(\A t \in DOMAIN f :
+                LET t2 == f[t] IN
+                /\ t.id      = t2.id
+                /\ t.service = t2.service
+                /\ VSlot(t)  = VSlot(t2),
+            "An update changes a task's identity!")
+  /\ tasks' = (tasks \ DOMAIN f) \union Range(f)
+
+(* The set of possible new vslots for `sid'. *)
 UnusedVSlot(sid) ==
   IF IsReplicated(sid) THEN Slot \ VSlotsOf(sid)
                        ELSE Node \ VSlotsOf(sid)
 
+(* The set of possible IDs for a new task in a vslot.
+
+   This is just the set of unallocated IDs globally -- we don't care
+   about `sid' and `vslot'.
+   However, for modelling purposes it may be useful to override this.
+ *)
+UnusedId(sid, vslot) ==
+  LET usedIds == { t.id : t \in tasks }
+  IN  TaskId \ usedIds
+
 (* Create a new task/slot if the number of runnable tasks is less than the number requested. *)
 CreateSlot ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E sid \in DOMAIN services,           \* `sid' is an existing service
-        id  \in TaskId \ DOMAIN tasks :    \* `id' is an unused TaskId
+  /\ \E sid \in DOMAIN services :          \* `sid' is an existing service
      (* For replicated tasks, only create as many slots as we need.
         For global tasks, we want all possible vslots (nodes). *)
      /\ IsReplicated(sid) =>
           services[sid].replicas > Cardinality(VSlotsOf(sid))  \* Desired > actual
      /\ \E slot \in UnusedVSlot(sid) :
-           tasks' = tasks @@ id :> NewTask(sid, slot, running)
+        \E id   \in UnusedId(sid, slot) :
+           tasks' = tasks \union { NewTask(sid, slot, id, running) }
 
 (* Add a task if a slot exists, contains no runnable tasks, and we weren't trying to remove it.
    Note: if we are trying to remove it, the slot will eventually disappear and CreateSlot will
@@ -350,11 +374,11 @@ ReplaceTask ==
   /\ \E sid  \in DOMAIN services :
      \E slot \in VSlotsOf(sid) :
      /\ \A task \in TasksOfVSlot(sid, slot) :    \* If all tasks in `slot' are
-           running \prec State(task)             \* dead (not runnable) and
+           ~Runnable(task)                       \* dead (not runnable) and
      /\ \E task \in TasksOfVSlot(sid, slot) :    \* there is some task that
-           tasks[task].desired_state # remove    \* we're not trying to remove,
-     /\ \E id \in TaskId \ DOMAIN tasks :        \* then create a replacement task:
-        tasks' = tasks @@ id :> NewTask(sid, slot, running)
+           task.desired_state # remove           \* we're not trying to remove,
+     /\ \E id \in UnusedId(sid, slot) :          \* then create a replacement task:
+        tasks' = tasks \union { NewTask(sid, slot, id, running) }
 
 (* If we have more replicas than the spec asks for, remove one of them. *)
 RequestRemoval ==
@@ -364,27 +388,26 @@ RequestRemoval ==
        IN \* Note: `current' excludes tasks we're already trying to kill
        /\ IsReplicated(sid)
        /\ services[sid].replicas < Cardinality(current)   \* We have too many replicas
-       /\ \E slot \in { tasks[i].slot : i \in current } : \* Choose an allocated slot
+       /\ \E slot \in { t.slot : t \in current } :        \* Choose an allocated slot
             (* XXX: spec says ``Tasks that were removed because of service removal
                     or scale down are not kept around in task history.
                     Does that include tasks that had already finished for some
                     other reason? *)
             \* Mark all tasks for that slot for removal:
-            tasks' = [ i \in TasksOfVSlot(sid, slot) |->
-                        [ tasks[i] EXCEPT !.desired_state = remove ]
-                     ] @@ tasks
+            UpdateTasks( [ t \in TasksOfVSlot(sid, slot) |->
+                            [t EXCEPT !.desired_state = remove] ] )
 
 (* Mark a terminated task for removal if we already have `maxTerminated' terminated tasks for this slot. *)
 CleanupTerminated ==
   /\ UNCHANGED << services, nEvents >>
   /\ \E sid  \in DOMAIN services :
      \E slot \in VSlotsOf(sid) :
-     LET termTasksInSlot == { x \in TasksOfVSlot(sid, slot) :
-                              State(x) \in { complete, shutdown, failed, rejected } }
+     LET termTasksInSlot == { t \in TasksOfVSlot(sid, slot) :
+                              State(t) \in { complete, shutdown, failed, rejected } }
      IN
      /\ Cardinality(termTasksInSlot) > maxTerminated    \* Too many tasks for slot
-     /\ \E i \in termTasksInSlot :                      \* Pick a victim to remove
-           tasks' = [tasks EXCEPT ![i].desired_state = remove]
+     /\ \E t \in termTasksInSlot :                      \* Pick a victim to remove
+        UpdateTasks(t :> [t EXCEPT !.desired_state = remove])
 
 (*
    We don't model the updater explicitly, but we allow any task to be restarted (perhaps with
@@ -397,14 +420,17 @@ CleanupTerminated ==
 RestartTask ==
   /\ UNCHANGED << services >>
   /\ CountEvent
-  /\ \E oldId \in DOMAIN tasks,
-        newId \in TaskId \ DOMAIN tasks :
-        /\ State(oldId) \preceq running              \* Victim must be runnable
-        /\ tasks[oldId].desired_state \prec shutdown \* and we're not trying to kill it
+  /\ \E oldT \in tasks :
+     \E newId \in UnusedId(oldT.service, VSlot(oldT)) :
+        /\ Runnable(oldT)                           \* Victim must be runnable
+        /\ oldT.desired_state \prec shutdown        \* and we're not trying to kill it
         \* Create the new task in the `ready' state (see ReleaseReady below):
-        /\ LET replacement == NewTask(tasks[oldId].service, VSlot(oldId), ready)
-           IN  tasks' = newId :> replacement
-                @@ [tasks EXCEPT ![oldId].desired_state = shutdown]
+        /\ LET replacement == NewTask(oldT.service, VSlot(oldT), newId, ready)
+           IN  tasks' =
+                (tasks \ {oldT}) \union {
+                  [oldT EXCEPT !.desired_state = shutdown],
+                  replacement
+                }
 
 (* A task is set to wait at `ready' and the previous task for that slot has now finished.
    Allow it to proceed to `running'.
@@ -418,15 +444,12 @@ RestartTask ==
    *)
 ReleaseReady ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E id \in DOMAIN tasks :
-       LET sid  == tasks[id].service
-           slot == VSlot(id)
-       IN
-       /\ tasks[id].desired_state = ready   \* (and not e.g. `remove')
-       /\ State(id) = ready
-       /\ \A other \in TasksOfVSlot(sid, slot) \ {id} :
-             running \prec State(other)   \* All other tasks have finished
-       /\ tasks' = [tasks EXCEPT ![id].desired_state = running]
+  /\ \E t \in tasks :
+       /\ t.desired_state = ready         \* (and not e.g. `remove')
+       /\ State(t) = ready
+       /\ \A other \in TasksOfVSlot(t.service, VSlot(t)) \ {t} :
+             ~Runnable(other)             \* All other tasks have finished
+       /\ UpdateTasks(t :> [t EXCEPT !.desired_state = running])
 
 (** XXX: `orchestrators.md' says it also ``deletes the linked tasks when a service is deleted.''
     How do you delete a task? Presumably it needs to be shut down first, somehow. *)
@@ -453,9 +476,9 @@ Orchestrator ==
    which are necessary for the tasks to run''. However, we don't model any resources here. *)
 Allocator ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E id \in DOMAIN tasks :
-     /\ State(id) = new
-     /\ tasks' = [tasks EXCEPT ![id].status.state = pending]
+  /\ \E t \in tasks :
+     /\ State(t) = new
+     /\ UpdateTasks(t :> [t EXCEPT !.status.state = pending])
 
 -------------------------------------------------------------------------------
 \*  Actions performed the scheduler
@@ -464,18 +487,15 @@ Allocator ==
    once sufficient resources are available (we don't model resources here). *)
 Scheduler ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E id \in DOMAIN tasks :
-     /\ State(id) = pending
-     /\ LET requestedNode  == tasks[id].node
-            candidateNodes == IF requestedNode = unassigned
+  /\ \E t \in tasks :
+     /\ State(t) = pending
+     /\ LET candidateNodes == IF t.node = unassigned
                                 THEN Node  \* (all nodes)
-                                ELSE { requestedNode }
+                                ELSE { t.node }
         IN
         \E node \in candidateNodes :
-           tasks' = [tasks EXCEPT
-                        ![id].status.state = assigned,
-                        ![id].node = node
-                    ]
+           UpdateTasks(t :> [t EXCEPT !.status.state = assigned,
+                                      !.node = node ])
 
 -------------------------------------------------------------------------------
 \*  Actions performed by worker nodes (actually, by the dispatcher on their behalf)
@@ -486,11 +506,12 @@ Scheduler ==
         I'm assuming the `ready' state occurs in between `preparing' and `starting'. *)
 ProgressTask ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E id \in DOMAIN tasks,
+  /\ \E t  \in tasks,
         s2 \in TaskState :   \* The state we want to move to
-        /\ tasks' = [tasks EXCEPT ![id].status.state = s2]
-        /\ s2 \preceq tasks[id].desired_state \* Can't be after the desired state
-        /\ << State(id), State(id)' >> \in {  \* Possible ``progress'' (desirable) transitions
+        LET t2 == [t EXCEPT !.status.state = s2]
+        IN
+        /\ s2 \preceq t.desired_state       \* Can't be after the desired state
+        /\ << State(t), State(t2) >> \in {  \* Possible ``progress'' (desirable) transitions
              << assigned, accepted >>,
              << accepted, preparing >>,
              << preparing, ready >>,
@@ -502,14 +523,15 @@ ProgressTask ==
              << rejected, remove >>,
              << shutdown, remove >>
            }
+        /\ UpdateTasks(t :> t2)
 
 (* A running container finishes because we stopped it. *)
 ShutdownComplete ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E id \in DOMAIN tasks :
-     /\ tasks[id].desired_state \in {shutdown, remove}        \* We are trying to stop it
-     /\ State(id) = running                                   \* It is currently running
-     /\ tasks' = [tasks EXCEPT ![id].status.state = shutdown] \* It moves to the shutdown state
+  /\ \E t \in tasks :
+     /\ t.desired_state \in {shutdown, remove}                  \* We are trying to stop it
+     /\ State(t) = running                                      \* It is currently running
+     /\ UpdateTasks(t :> [t EXCEPT !.status.state = shutdown])  \* It becomes shutdown
 
 (* A node can reject a task once it's responsible for it (it has reached `assigned')
    until it reaches the `running' state.
@@ -517,24 +539,24 @@ ShutdownComplete ==
 RejectTask ==
   /\ UNCHANGED << services >>
   /\ CountEvent
-  /\ \E id \in DOMAIN tasks :
-       /\ State(id) \in { assigned, accepted, preparing, ready, starting }
-       /\ tasks' = [tasks EXCEPT ![id].status.state = rejected]
+  /\ \E t \in tasks :
+       /\ State(t) \in { assigned, accepted, preparing, ready, starting }
+       /\ UpdateTasks(t :> [t EXCEPT !.status.state = rejected])
 
 (* A running container finishes running on its own. *)
 ContainerExit ==
   /\ UNCHANGED << services >>
   /\ CountEvent
-  /\ \E i  \in DOMAIN tasks,
+  /\ \E t  \in tasks,
         s2 \in {failed, complete} :      \* Either a successful or failed exit status
-        /\ State(i) = running
-        /\ tasks' = [tasks EXCEPT ![i].status.state = s2]
+        /\ State(t) = running
+        /\ UpdateTasks(t :> [t EXCEPT !.status.state = s2])
 
 (* Tasks assigned to a node and for which the node is responsible. *)
-TasksOwnedByNode(n) == { i \in DOMAIN tasks :
-  /\ tasks[i].node = n
-  /\ assigned \preceq State(i)
-  /\ State(i) \prec remove
+TasksOwnedByNode(n) == { t \in tasks :
+  /\ t.node = n
+  /\ assigned \preceq State(t)
+  /\ State(t) \prec remove
 }
 
 (* The dispatcher notices that the worker is down.
@@ -551,9 +573,8 @@ WorkerDown ==
   /\ UNCHANGED << services >>
   /\ CountEvent
   /\ \E n \in Node :                        \* Node `n' is detected as down
-        tasks' = [ i \in TasksOwnedByNode(n) |->
-                     [ tasks[i] EXCEPT !.status.state = orphaned ]
-                 ] @@ tasks
+       UpdateTasks([ t \in TasksOwnedByNode(n) |->
+                      [t EXCEPT !.status.state = orphaned] ])
 
 (* Actions we require to happen eventually when possible. *)
 AgentProgress ==
@@ -575,9 +596,9 @@ Agent ==
    XXX: really forget about orphans? *)
 Reaper ==
   /\ UNCHANGED << services, nEvents >>
-  /\ \E i \in DOMAIN tasks :
-      /\ State(i) \in {remove, orphaned}
-      /\ tasks' = [t \in DOMAIN tasks \ {i} |-> tasks[t]]
+  /\ \E t \in tasks :
+      /\ State(t) \in {remove, orphaned}
+      /\ tasks' = tasks \ {t}
 
 -------------------------------------------------------------------------------
 \*  The complete system
@@ -587,7 +608,7 @@ vars == << tasks, services, nEvents >>
 
 \* Initially there are no tasks and no services
 Init ==
-  /\ tasks = << >>
+  /\ tasks = {}
   /\ services = << >>
   /\ InitEvents
 
@@ -630,82 +651,113 @@ Spec ==
 
 \* A state invariant (things that should be true in every state).
 Inv ==
-  \A id \in DOMAIN tasks :
+  \A t \in tasks :
     (* Every task has a service:
 
        XXX: The spec says: ``In some cases, there are tasks that exist independent of any service.
             These do not have a value set in service_id.''. Need an example of one. *)
-    /\ tasks[id].service \in DOMAIN services
+    /\ t.service \in DOMAIN services
     \* Tasks have nodes once they reach `assigned':
-    /\ assigned \preceq State(id) => tasks[id].node \in Node
+    /\ assigned \preceq State(t) => t.node \in Node
+    \* Task IDs are unique
+    /\ \A t2 \in tasks : t.id = t2.id => t = t2
 
 \* A special ``state'' used when a task doesn't exist.
 null == "null"
 
-\* All the possible transitions
-Transition == {
-  << null, new >>,
-  << new, pending >>,
-  << pending, assigned >>,
+(* All the possible transitions, grouped by the component that performs them. *)
+Transitions == [
+  orchestrator |-> {
+    << null, new >>
+  },
 
-  << assigned, accepted >>,
-  << accepted, preparing >>,
-  << preparing, ready >>,
-  << ready, starting >>,
-  << starting, running >>,
+  allocator |-> {
+    << new, pending >>
+  },
 
-  << assigned, rejected >>,
-  << accepted, rejected >>,
-  << preparing, rejected >>,
-  << ready, rejected >>,
-  << starting, rejected >>,
+  scheduler |-> {
+    << pending, assigned >>
+  },
 
-  << running, complete >>,
-  << running, failed >>,
+  agent |-> {
+    << assigned, accepted >>,
+    << accepted, preparing >>,
+    << preparing, ready >>,
+    << ready, starting >>,
+    << starting, running >>,
 
-  << running, shutdown >>,
+    << assigned, rejected >>,
+    << accepted, rejected >>,
+    << preparing, rejected >>,
+    << ready, rejected >>,
+    << starting, rejected >>,
 
-  << shutdown, remove >>,
-  << rejected, remove >>,
-  << complete, remove >>,
-  << failed, remove >>,
+    << running, complete >>,
+    << running, failed >>,
 
-  << assigned, orphaned >>,
-  << accepted, orphaned >>,
-  << preparing, orphaned >>,
-  << ready, orphaned >>,
-  << starting, orphaned >>,
-  << rejected, orphaned >>,
-  << running, orphaned >>,
-  << complete, orphaned >>,
-  << failed, orphaned >>,
-  << shutdown, orphaned >>,
+    << running, shutdown >>,
 
-  << remove, null >>,
-  << orphaned, null >>
-}
-\union { << x, x >> : x \in TaskState \union {null} }           \* The state can always not change
+    << shutdown, remove >>,
+    << rejected, remove >>,
+    << complete, remove >>,
+    << failed, remove >>,
 
-(* Check that `Transition' itself is OK - only transitions to higher numbered states are permitted. *)
+    << assigned, orphaned >>,
+    << accepted, orphaned >>,
+    << preparing, orphaned >>,
+    << ready, orphaned >>,
+    << starting, orphaned >>,
+    << rejected, orphaned >>,
+    << running, orphaned >>,
+    << complete, orphaned >>,
+    << failed, orphaned >>,
+    << shutdown, orphaned >>
+  },
+
+  reaper |-> {
+    << remove, null >>,
+    << orphaned, null >>
+  }
+]
+
+(* Check that `Transitions' itself is OK. *)
 TransitionTableOK ==
-  \A << s1, s2 >> \in Transition :
-    \/ s1 = null
-    \/ s2 = null
-    \/ s1 \preceq s2
+  \* No transition moves to a lower-ranked state:
+  /\ \A actor \in DOMAIN Transitions :
+     \A << s1, s2 >> \in Transitions[actor] :
+        \/ s1 = null
+        \/ s2 = null
+        \/ s1 \preceq s2
+  \* Every source state has exactly one component which handles transitions out of that state:
+  /\ \A a1, a2 \in DOMAIN Transitions :
+     LET Source(a) == { s[1] : s \in Transitions[a] }
+     IN  a1 # a2 =>
+           Source(a1) \intersect Source(a2) = {}
 
 ASSUME TransitionTableOK  \* Note: ASSUME means ``check'' to TLC
 
+IdSet(S) == { x.id : x \in S }
+
+(* The state of task `i' in `S', or `null' if it doesn't exist *)
+Get(S, i) ==
+  LET cand == { x \in S : x.id = i }
+  IN  IF cand = {} THEN null
+                   ELSE State(CHOOSE x \in cand : TRUE)
+
 (* An action in which all transitions were valid. *)
 TransitionOK ==
-  \A id \in TaskId :
-     LET s1 == IF id \in DOMAIN tasks  THEN State(id)  ELSE null
-         s2 == IF id \in DOMAIN tasks' THEN State(id)' ELSE null
-     IN
-     << s1, s2 >> \in Transition
-
-(* The orchestrator never changes the state of a task (it only creates new ones, or sets `desired_state'). *)
-OrchestratorPreservesState ==
-  Orchestrator => \A i \in DOMAIN tasks \intersect DOMAIN tasks' : State(i) = State(i)'
+  LET permitted == { << x, x >> : x \in TaskState } \union  \* No change is always OK
+    CASE Orchestrator -> Transitions.orchestrator
+      [] Allocator    -> Transitions.allocator
+      [] Scheduler    -> Transitions.scheduler
+      [] Agent        -> Transitions.agent
+      [] Reaper       -> Transitions.reaper
+      [] OTHER        -> {}
+    oldIds == IdSet(tasks)
+    newIds == IdSet(tasks')
+  IN
+  \A id \in newIds \union oldIds :
+     << Get(tasks, id), Get(tasks', id) >> \in permitted
 
 (* Some of the expressions below are ``temporal formulas''. Unlike state expressions and actions,
    these look at a complete behaviour (sequence of states). Summary of notation:
@@ -720,22 +772,24 @@ OrchestratorPreservesState ==
 \* A temporal formula that checks transitions
 TransitionsOK ==
   /\ [][TransitionOK]_vars      \* Every step satisfies TransitionOK (or leaves `vars' unchanged)
-  /\ [][OrchestratorPreservesState]_vars
 
 (* Every service has the right number of running tasks (the system is in the desired state). *)
 InDesiredState ==
   \A sid \in DOMAIN services :
-    LET runningTasks  == { i \in TasksOf(sid) : State(i) = running }
-        nRunning      == Cardinality(runningTasks)
-    IN
-    IF IsReplicated(sid) THEN
-       /\ nRunning = services[sid].replicas
-    ELSE
-       /\ IsGlobal(sid)
-       \* We have as many tasks as nodes:
-       /\ nRunning = Cardinality(Node)
-       \* We have a task for every node:
-       /\ { tasks[i].node : i \in runningTasks } = Node
+    \* The service has the correct set of running replicas:
+    /\ LET runningTasks  == { t \in TasksOf(sid) : State(t) = running }
+           nRunning      == Cardinality(runningTasks)
+       IN
+       CASE IsReplicated(sid) -> nRunning = services[sid].replicas
+         [] IsGlobal(sid) ->
+              \* We have as many tasks as nodes:
+              /\ nRunning = Cardinality(Node)
+              \* We have a task for every node:
+              /\ { t.node : t \in runningTasks } = Node
+    \* The service does not have too many terminated tasks
+    /\ \A slot \in VSlotsOf(sid) :
+       LET terminated == { t \in TasksOfVSlot(sid, slot) : ~Runnable(t) }
+       IN  Cardinality(terminated) <= maxTerminated
 
 (* The main property we want to check.
 
@@ -755,6 +809,3 @@ EventuallyAsDesired ==
   \/ <>[] InDesiredState             \* or we eventually get to the desired state and stay there.
 
 =============================================================================
-\* Modification History
-\* Last modified Thu Apr 19 14:55:46 BST 2018 by tal
-\* Created Mon Apr 16 11:31:19 BST 2018 by tal
