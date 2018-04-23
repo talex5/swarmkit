@@ -126,7 +126,8 @@ TaskStatus == [
 (* This has every field mentioned in `task_model.md' except for `spec', which
    it doesn't seem to use for anything.
 
-   XXX: can desired_state be any state, or just some (e.g. {ready, running, shutdown, remove})? *)
+   `desired_state' can be any state, although currently we only ever set it to one of
+    {ready, running, shutdown, remove}. *)
 Task == [
   id : TaskId,                      \* To uniquely identify this task
   service : ServiceId,              \* The service that owns the task
@@ -136,8 +137,13 @@ Task == [
   slot : Slot \union {global}       \* A way of tracking related tasks
 ]
 
+nodeUp   == "up"
+nodeDown == "down"
+NodeState == { nodeUp, nodeDown }
+
 VARIABLE tasks          \* The set of currently-allocated tasks
 VARIABLE services       \* A map of currently-allocated services, indexed by ServiceId
+VARIABLE nodes          \* Maps nodes to SwarmKit's view of their NodeState
 
 (* The current state of task `t'. *)
 State(t) == t.status.state
@@ -153,6 +159,8 @@ TypeOK ==
   \* `services' is a mapping from service IDs to ServiceSpecs:
   /\ DOMAIN services \subseteq ServiceId
   /\ services \in [ DOMAIN services -> ServiceSpec ]
+  \* Nodes are up or down
+  /\ nodes \in [ Node -> NodeState ]
 
 -------------------------------------------------------------------------------
 \* Model checking
@@ -246,14 +254,14 @@ CountEvent ==
          i.e. the set A with all elements in B removed.
    *)
 CreateService ==
-  /\ UNCHANGED << tasks, nEvents >>
+  /\ UNCHANGED << tasks, nodes, nEvents >>
   /\ \E sid \in ServiceId \ DOMAIN services,  \* `sid' is an unused ServiceId
        spec \in ServiceSpec :                 \* `spec' is any ServiceSpec
           services' = services @@ sid :> spec \* Add `sid |-> spec' to `services'
 
 (* Update an existing service's spec. *)
 UpdateService ==
-  /\ UNCHANGED << tasks >>
+  /\ UNCHANGED << tasks, nodes >>
   /\ CountEvent \* Flag as an event for model-checking purposes
   /\ \E sid     \in DOMAIN services,        \* `sid' is an existing ServiceId
         newSpec \in ServiceSpec :           \* `newSpec' is any `ServiceSpec'
@@ -266,7 +274,10 @@ User ==
   \/ CreateService
   \/ UpdateService
 
-(* XXX: what about removing a service? (not described in any detail in the design docs) *)
+(* Removing a service is not currently modelled, as the SwarmKit developers are currently
+   ``working on a change to the service object to flag it for removal, instead of removing it outright''
+
+   TODO: update the model once the new design is available *)
 
 -------------------------------------------------------------------------------
 \* Actions performed the orchestrator
@@ -350,7 +361,7 @@ UnusedId(sid, vslot) ==
 
 (* Create a new task/slot if the number of runnable tasks is less than the number requested. *)
 CreateSlot ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E sid \in DOMAIN services :          \* `sid' is an existing service
      (* For replicated tasks, only create as many slots as we need.
         For global tasks, we want all possible vslots (nodes). *)
@@ -364,13 +375,13 @@ CreateSlot ==
    Note: if we are trying to remove it, the slot will eventually disappear and CreateSlot will
    then make a new one if we later need it again.
 
-   XXX: Do slots actually exist as things in the store, or do we just infer that a slot exists because
-        there exists a task with that slot ID? Currently, we assume the latter.
-        This has the odd effect that if `maxTerminated = 0' then we may create new slots rather than reusing
-        existing ones, depending on exactly when the reaper runs.
+   Currently in SwarmKit, slots do not actually exist as objects in the store.
+   Instead, we just infer that a slot exists because there exists a task with that slot ID.
+   This has the odd effect that if `maxTerminated = 0' then we may create new slots rather than reusing
+   existing ones, depending on exactly when the reaper runs.
    *)
 ReplaceTask ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E sid  \in DOMAIN services :
      \E slot \in VSlotsOf(sid) :
      /\ \A task \in TasksOfVSlot(sid, slot) :    \* If all tasks in `slot' are
@@ -382,24 +393,20 @@ ReplaceTask ==
 
 (* If we have more replicas than the spec asks for, remove one of them. *)
 RequestRemoval ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E sid \in DOMAIN services :
        LET current == RunnableWantedTasks(sid)
        IN \* Note: `current' excludes tasks we're already trying to kill
        /\ IsReplicated(sid)
        /\ services[sid].replicas < Cardinality(current)   \* We have too many replicas
        /\ \E slot \in { t.slot : t \in current } :        \* Choose an allocated slot
-            (* XXX: spec says ``Tasks that were removed because of service removal
-                    or scale down are not kept around in task history.
-                    Does that include tasks that had already finished for some
-                    other reason? *)
             \* Mark all tasks for that slot for removal:
             UpdateTasks( [ t \in TasksOfVSlot(sid, slot) |->
                             [t EXCEPT !.desired_state = remove] ] )
 
 (* Mark a terminated task for removal if we already have `maxTerminated' terminated tasks for this slot. *)
 CleanupTerminated ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E sid  \in DOMAIN services :
      \E slot \in VSlotsOf(sid) :
      LET termTasksInSlot == { t \in TasksOfVSlot(sid, slot) :
@@ -409,16 +416,10 @@ CleanupTerminated ==
      /\ \E t \in termTasksInSlot :                      \* Pick a victim to remove
         UpdateTasks(t :> [t EXCEPT !.desired_state = remove])
 
-(*
-   We don't model the updater explicitly, but we allow any task to be restarted (perhaps with
-   a different image) at any time, which should cover the behaviours of the restart supervisor.
-
-   XXX: `orchestrators.md' says: ``[The Restart supervisor] atomically changes the state of the old task to Shutdown''.
-   However, this conflicts with the claim that only the agent can change the state of a running task.
-   Presumably it means the desired state.
-*)
+(* We don't model the updater explicitly, but we allow any task to be restarted (perhaps with
+   a different image) at any time, which should cover the behaviours of the restart supervisor. *)
 RestartTask ==
-  /\ UNCHANGED << services >>
+  /\ UNCHANGED << services, nodes >>
   /\ CountEvent
   /\ \E oldT \in tasks :
      \E newId \in UnusedId(oldT.service, VSlot(oldT)) :
@@ -437,22 +438,15 @@ RestartTask ==
 
    TODO: ``However, there are also cases where a slot may have multiple tasks with the
    desired state of RUNNING. This can happen during rolling updates when the updates
-   are configured to start the new task before stopping the old one.'' - need to implement this
-
-   XXX: ``The updater takes care of making sure that each slot converges to having a single running task.''
-   How does it do that?
-   *)
+   are configured to start the new task before stopping the old one.'' - need to implement this *)
 ReleaseReady ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
        /\ t.desired_state = ready         \* (and not e.g. `remove')
        /\ State(t) = ready
        /\ \A other \in TasksOfVSlot(t.service, VSlot(t)) \ {t} :
              ~Runnable(other)             \* All other tasks have finished
        /\ UpdateTasks(t :> [t EXCEPT !.desired_state = running])
-
-(** XXX: `orchestrators.md' says it also ``deletes the linked tasks when a service is deleted.''
-    How do you delete a task? Presumably it needs to be shut down first, somehow. *)
 
 (* Tasks that the orchestrator must always do eventually if it can: *)
 OrchestratorProgress ==
@@ -474,11 +468,27 @@ Orchestrator ==
 
    The spec says the allocator will ``allocate resources such as network attachments
    which are necessary for the tasks to run''. However, we don't model any resources here. *)
-Allocator ==
-  /\ UNCHANGED << services, nEvents >>
+AllocateTask ==
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
      /\ State(t) = new
      /\ UpdateTasks(t :> [t EXCEPT !.status.state = pending])
+
+(* The allocator rejects the task because there aren't enough resources.
+
+   XXX: Not clear whether SwarmKit actually does this. *)
+RejectAllocation ==
+  /\ UNCHANGED << services, nodes, nEvents >>
+  /\ \E t \in tasks :
+     /\ State(t) = new
+     /\ UpdateTasks(t :> [t EXCEPT !.status.state = rejected])  \* XXX: Is this the right state?
+
+AllocatorProgress ==
+  \/ AllocateTask
+
+Allocator ==
+  \/ AllocatorProgress
+  \/ RejectAllocation
 
 -------------------------------------------------------------------------------
 \*  Actions performed the scheduler
@@ -486,7 +496,7 @@ Allocator ==
 (* The scheduler assigns a node to a `pending' task and moves it to `assigned'
    once sufficient resources are available (we don't model resources here). *)
 Scheduler ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
      /\ State(t) = pending
      /\ LET candidateNodes == IF t.node = unassigned
@@ -500,12 +510,12 @@ Scheduler ==
 -------------------------------------------------------------------------------
 \*  Actions performed by worker nodes (actually, by the dispatcher on their behalf)
 
-(* Try to advance containers towards `desired_state' if we're not there yet.
+(* SwarmKit thinks the node is up. i.e. the agent is connected to a manager. *)
+IsUp(n) == nodes[n] = nodeUp
 
-   XXX: Spec says ``A task will progress through the ACCEPTED, PREPARING, and STARTING states on the way to RUNNING.''
-        I'm assuming the `ready' state occurs in between `preparing' and `starting'. *)
+(* Try to advance containers towards `desired_state' if we're not there yet. *)
 ProgressTask ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t  \in tasks,
         s2 \in TaskState :   \* The state we want to move to
         LET t2 == [t EXCEPT !.status.state = s2]
@@ -516,40 +526,42 @@ ProgressTask ==
              << accepted, preparing >>,
              << preparing, ready >>,
              << ready, starting >>,
-             << starting, running >>,
-
-             << failed, remove >>,
-             << complete, remove >>,
-             << rejected, remove >>,
-             << shutdown, remove >>
+             << starting, running >>
            }
+        /\ IsUp(t.node)                     \* Node must be connected to SwarmKit
         /\ UpdateTasks(t :> t2)
 
 (* A running container finishes because we stopped it. *)
 ShutdownComplete ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
      /\ t.desired_state \in {shutdown, remove}                  \* We are trying to stop it
      /\ State(t) = running                                      \* It is currently running
+     /\ IsUp(t.node)
      /\ UpdateTasks(t :> [t EXCEPT !.status.state = shutdown])  \* It becomes shutdown
 
 (* A node can reject a task once it's responsible for it (it has reached `assigned')
    until it reaches the `running' state.
    Note that an ``accepted'' task can still be rejected. *)
 RejectTask ==
-  /\ UNCHANGED << services >>
+  /\ UNCHANGED << services, nodes >>
   /\ CountEvent
   /\ \E t \in tasks :
        /\ State(t) \in { assigned, accepted, preparing, ready, starting }
+       /\ IsUp(t.node)
        /\ UpdateTasks(t :> [t EXCEPT !.status.state = rejected])
 
-(* A running container finishes running on its own. *)
+(* A running container finishes running on its own.
+
+   TODO: we should model the actual state of containers separately from
+   the SwarmKit manager's record of their states. *)
 ContainerExit ==
-  /\ UNCHANGED << services >>
+  /\ UNCHANGED << services, nodes >>
   /\ CountEvent
   /\ \E t  \in tasks,
         s2 \in {failed, complete} :      \* Either a successful or failed exit status
         /\ State(t) = running
+        /\ IsUp(t.node)
         /\ UpdateTasks(t :> [t EXCEPT !.status.state = s2])
 
 (* Tasks assigned to a node and for which the node is responsible. *)
@@ -559,27 +571,49 @@ TasksOwnedByNode(n) == { t \in tasks :
   /\ State(t) \prec remove
 }
 
-(* The dispatcher notices that the worker is down.
-   Note that we don't bother with a `WorkerUp' event.
-   The worker is assumed to be up next time it performs an action.
-
-   When a worker is detected as down its tasks will all become `ophaned'.
-   When the worker comes back, it may then try to report that the task
-   is e.g. `running'. This can't be recorded because states can't go backwards.
-   I assume that this problem is resolved in the protocol between the dispatcher
-   and the agent, with the dispatcher telling the agent to kill the task.
-   As far as the swarm log is concerned, the task never recovers. *)
+(* The dispatcher notices that the worker is down (the connection is lost). *)
 WorkerDown ==
-  /\ UNCHANGED << services >>
+  /\ UNCHANGED << tasks, services >>
   /\ CountEvent
-  /\ \E n \in Node :                        \* Node `n' is detected as down
-       UpdateTasks([ t \in TasksOwnedByNode(n) |->
-                      [t EXCEPT !.status.state = orphaned] ])
+  /\ \E n \in Node :
+       /\ IsUp(n)
+       /\ nodes' = [nodes EXCEPT ![n] = nodeDown]
+
+(* When the node reconnects to the cluster, it gets an assignment set from the dispatcher
+   which does not include any tasks that have been marked orphaned and then deleted.
+   Any time an agent gets an assignment set that does not include some task it has running,
+   it shuts down those tasks.
+
+   Currently, we don't model the state of the tasks on the node separately from the SwarmKit
+   state. *)
+WorkerUp ==
+  /\ UNCHANGED << tasks, services, nEvents >>
+  /\ \E n \in Node :
+       /\ ~IsUp(n)
+       /\ nodes' = [nodes EXCEPT ![n] = nodeUp]
+
+(* If SwarmKit sees a node as down for a long time (48 hours or so) then
+   it marks all the node's tasks as orphaned.
+
+   ``Moving a task to the Orphaned state is not desirable,
+   because it's the one case where we break the otherwise invariant
+   that the agent sets all states past ASSIGNED.''
+*)
+OrphanTasks ==
+  /\ UNCHANGED << services, nodes, nEvents >>
+  /\ \E n \in Node :
+       LET affected == { t \in TasksOwnedByNode(n) : Runnable(t) }
+       IN
+       /\ ~IsUp(n)    \* Node `n' is still detected as down
+       /\ UpdateTasks([ t \in affected |->
+                         [t EXCEPT !.status.state = orphaned] ])
 
 (* Actions we require to happen eventually when possible. *)
 AgentProgress ==
   \/ ProgressTask
   \/ ShutdownComplete
+  \/ OrphanTasks
+  \/ WorkerUp
 
 (* All actions of the agent/worker. *)
 Agent ==
@@ -593,23 +627,30 @@ Agent ==
 
 (* Forget about tasks in remove or orphan states.
 
-   XXX: really forget about orphans? *)
+   Orphaned tasks belong to nodes that we are assuming are lost forever.
+   Or, at the very least, it's likely that a node outage lasting longer than the timeout
+   has crashed and will come up with nothing running (which is an equally fine outcome).
+
+   TODO: model worker nodes crashing
+*)
 Reaper ==
-  /\ UNCHANGED << services, nEvents >>
+  /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
-      /\ State(t) \in {remove, orphaned}
+      /\ \/ (~Runnable(t) /\ t.desired_state = remove)
+         \/ State(t) = orphaned
       /\ tasks' = tasks \ {t}
 
 -------------------------------------------------------------------------------
 \*  The complete system
 
 \* All the variables
-vars == << tasks, services, nEvents >>
+vars == << tasks, services, nodes, nEvents >>
 
-\* Initially there are no tasks and no services
+\* Initially there are no tasks and no services, and all nodes are up.
 Init ==
   /\ tasks = {}
   /\ services = << >>
+  /\ nodes = [ n \in Node |-> nodeUp ]
   /\ InitEvents
 
 (* A next step is one in which any of these sub-components takes a step: *)
@@ -635,7 +676,12 @@ Spec ==
      which SwarmKit stops doing anything forever, even though it could advance some task
      from the `new' state, isn't a valid behaviour of the system.
      This property is called ``weak fairness''. *)
-  /\ WF_vars(OrchestratorProgress \/ Allocator \/ Scheduler \/ AgentProgress \/ Reaper)
+  /\ WF_vars(OrchestratorProgress)
+  /\ WF_vars(AllocatorProgress)
+  /\ WF_vars(Scheduler)
+  /\ WF_vars(AgentProgress)
+  /\ WF_vars(Reaper)
+  /\ WF_vars(WorkerUp)
      (* We don't require fairness of:
         - User (we don't control them),
         - RestartTask (services aren't required to be updated),
@@ -657,8 +703,10 @@ Inv ==
        XXX: The spec says: ``In some cases, there are tasks that exist independent of any service.
             These do not have a value set in service_id.''. Need an example of one. *)
     /\ t.service \in DOMAIN services
-    \* Tasks have nodes once they reach `assigned':
-    /\ assigned \preceq State(t) => t.node \in Node
+    \* Tasks have nodes once they reach `assigned', except maybe if rejected:
+    /\ assigned \preceq State(t) => t.node \in Node \/ State(t) = rejected
+    \* `remove' is only used as a desired state, not an actual one:
+    /\ State(t) # remove
     \* Task IDs are unique
     /\ \A t2 \in tasks : t.id = t2.id => t = t2
 
@@ -672,7 +720,8 @@ Transitions == [
   },
 
   allocator |-> {
-    << new, pending >>
+    << new, pending >>,
+    << new, rejected >>
   },
 
   scheduler |-> {
@@ -697,25 +746,19 @@ Transitions == [
 
     << running, shutdown >>,
 
-    << shutdown, remove >>,
-    << rejected, remove >>,
-    << complete, remove >>,
-    << failed, remove >>,
-
     << assigned, orphaned >>,
     << accepted, orphaned >>,
     << preparing, orphaned >>,
     << ready, orphaned >>,
     << starting, orphaned >>,
-    << rejected, orphaned >>,
-    << running, orphaned >>,
-    << complete, orphaned >>,
-    << failed, orphaned >>,
-    << shutdown, orphaned >>
+    << running, orphaned >>
   },
 
   reaper |-> {
-    << remove, null >>,
+    << rejected, null >>,
+    << complete, null >>,
+    << failed, null >>,
+    << shutdown, null >>,
     << orphaned, null >>
   }
 ]
@@ -803,6 +846,7 @@ InDesiredState ==
 EventuallyAsDesired ==
   \/ []<> <<User>>_vars              \* Either the user keeps changing the configuration,
   \/ []<> <<RestartTask>>_vars       \* or restarting/updating tasks,
+  \/ []<> <<RejectAllocation>>_vars  \* or the allocator keeps rejecting tasks,
   \/ []<> <<WorkerDown>>_vars        \* or workers keep failing,
   \/ []<> <<RejectTask>>_vars        \* or workers keep rejecting tasks,
   \/ []<> <<ContainerExit>>_vars     \* or the containers keep exiting,
