@@ -755,6 +755,3 @@ EventuallyAsDesired ==
   \/ <>[] InDesiredState             \* or we eventually get to the desired state and stay there.
 
 =============================================================================
-\* Modification History
-\* Last modified Thu Apr 19 14:55:46 BST 2018 by tal
-\* Created Mon Apr 16 11:31:19 BST 2018 by tal
