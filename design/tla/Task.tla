@@ -1,10 +1,12 @@
 This is a TLA+ model of SwarmKit. Even if you don't know TLA+, you should be able to
-get the general idea. Here is a very brief overview of the syntax:
+get the general idea. This section gives a very brief overview of the syntax.
 
 Declare `x' to be something that changes as the system runs:
+
 VARIABLE x
 
-Define `Init' to be a state predicate:
+Define `Init' to be a state predicate (== means ``is defined to be''):
+
 Init ==
   x = 0
 
@@ -13,6 +15,7 @@ the possible initial states of the system. For example, the state
 [ x |-> 0, y |-> 2, ... ] satisfies this.
 
 Define `Next' to be an action:
+
 Next ==
    /\ x' \in Nat
    /\ x' > x
@@ -32,13 +35,22 @@ of the syntax.
 This specification can be read as documentation, but it can also be executed by the TLC
 model checker. See the model checking section below for details about that.
 
+The rest of the document is organised as follows:
+
+1. Some parameters, types and definitions
+2. How to run the model checker
+3. Actions performed by the user
+4. Actions performed by the components of SwarmKit
+5. The complete system
+6. Properties of the system
+
 -------------------------------- MODULE Task --------------------------------
 
 (* A description of the task model in SwarmKit.
    Currently, this is mostly based on `design/task_model.md'.
 
    Note: I am not yet familiar with the SwarmKit code, and this document is likely to
-   be incorrect. It is my current guess about the design. I hope that SwarmKit
+   have some errors. It is my current guess about the design. I hope that SwarmKit
    developers will point out the errors.
  *)
 
@@ -49,7 +61,7 @@ Range(S) == { S[i] : i \in DOMAIN S }
 
 (* The set of worker nodes.
 
-   Note: a CONSTANT is an input to the model. It should work with any set of nodes you provide.
+   Note: a CONSTANT is an input to the model. The model should work with any set of nodes you provide.
 
    TODO: should cope with this changing at runtime, and with draining nodes. *)
 CONSTANT Node
@@ -137,6 +149,7 @@ Task == [
   slot : Slot \union {global}       \* A way of tracking related tasks
 ]
 
+(* The possible states of a node, as recorded by SwarmKit. *)
 nodeUp   == "up"
 nodeDown == "down"
 NodeState == { nodeUp, nodeDown }
@@ -284,11 +297,11 @@ User ==
 
 (* Note: This is by far the most complicated component in the model. You might want to read this section last... *)
 
-(* A replicated service specifies the number of replicas it wants. *)
+(* A replicated service is one that specifies some number of replicas it wants. *)
 IsReplicated(sid) ==
   services[sid].replicas \in Nat
 
-(* A global service wants one task running on each node. *)
+(* A global service is one that wants one task running on each node. *)
 IsGlobal(sid) ==
   services[sid].replicas = global
 
@@ -337,7 +350,8 @@ NewTask(sid, vslot, id, desired_state) ==
 UpdateTasks(f) ==
   /\ Assert(\A t \in DOMAIN f : t \in tasks, "An old task does not exist!")
   /\ Assert(\A t \in DOMAIN f :
-                LET t2 == f[t] IN
+                LET t2 == f[t]
+                IN
                 /\ t.id      = t2.id
                 /\ t.service = t2.service
                 /\ VSlot(t)  = VSlot(t2),
@@ -421,7 +435,7 @@ CleanupTerminated ==
 RestartTask ==
   /\ UNCHANGED << services, nodes >>
   /\ CountEvent
-  /\ \E oldT \in tasks :
+  /\ \E oldT  \in tasks :
      \E newId \in UnusedId(oldT.service, VSlot(oldT)) :
         /\ Runnable(oldT)                           \* Victim must be runnable
         /\ oldT.desired_state \prec shutdown        \* and we're not trying to kill it
@@ -476,7 +490,9 @@ AllocateTask ==
 
 (* The allocator rejects the task because there aren't enough resources.
 
-   XXX: Not clear whether SwarmKit actually does this. *)
+   XXX: Not clear whether SwarmKit actually does this.
+
+   TODO: model resources *)
 RejectAllocation ==
   /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
@@ -700,8 +716,8 @@ Inv ==
   \A t \in tasks :
     (* Every task has a service:
 
-       XXX: The spec says: ``In some cases, there are tasks that exist independent of any service.
-            These do not have a value set in service_id.''. Need an example of one. *)
+       TODO: The spec says: ``In some cases, there are tasks that exist independent of any service.
+             These do not have a value set in service_id.''. Add an example of one. *)
     /\ t.service \in DOMAIN services
     \* Tasks have nodes once they reach `assigned', except maybe if rejected:
     /\ assigned \preceq State(t) => t.node \in Node \/ State(t) = rejected
@@ -823,7 +839,8 @@ InDesiredState ==
     /\ LET runningTasks  == { t \in TasksOf(sid) : State(t) = running }
            nRunning      == Cardinality(runningTasks)
        IN
-       CASE IsReplicated(sid) -> nRunning = services[sid].replicas
+       CASE IsReplicated(sid) ->
+              /\ nRunning = services[sid].replicas
          [] IsGlobal(sid) ->
               \* We have as many tasks as nodes:
               /\ nRunning = Cardinality(Node)
@@ -844,12 +861,12 @@ InDesiredState ==
    problems then the system will eventually settle on InDesiredState.
 *)
 EventuallyAsDesired ==
-  \/ []<> <<User>>_vars              \* Either the user keeps changing the configuration,
-  \/ []<> <<RestartTask>>_vars       \* or restarting/updating tasks,
-  \/ []<> <<RejectAllocation>>_vars  \* or the allocator keeps rejecting tasks,
-  \/ []<> <<WorkerDown>>_vars        \* or workers keep failing,
-  \/ []<> <<RejectTask>>_vars        \* or workers keep rejecting tasks,
-  \/ []<> <<ContainerExit>>_vars     \* or the containers keep exiting,
-  \/ <>[] InDesiredState             \* or we eventually get to the desired state and stay there.
+  \/ []<> <<User>>_vars               \* Either the user keeps changing the configuration,
+  \/ []<> <<RestartTask>>_vars        \* or restarting/updating tasks,
+  \/ []<> <<RejectAllocation>>_vars   \* or the allocator keeps rejecting tasks,
+  \/ []<> <<WorkerDown>>_vars         \* or workers keep failing,
+  \/ []<> <<RejectTask>>_vars         \* or workers keep rejecting tasks,
+  \/ []<> <<ContainerExit>>_vars      \* or the containers keep exiting,
+  \/ <>[] InDesiredState              \* or we eventually get to the desired state and stay there.
 
 =============================================================================
