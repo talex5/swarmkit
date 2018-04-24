@@ -97,7 +97,8 @@ VARIABLE nodes          \* Maps nodes to SwarmKit's view of their NodeState
 ServiceSpec == [
   (* The replicas field is either a count giving the desired number of replicas,
      or the special value `global'. *)
-  replicas : 0..maxReplicas \union {global}
+  replicas : 0..maxReplicas \union {global},
+  remove   : BOOLEAN    \* The user wants to remove this service
 ]
 
 (* A replicated service is one that specifies some number of replicas it wants. *)
@@ -370,29 +371,43 @@ ASSUME Cardinality(TaskId) >= 1 + maxTerminated
    *)
 CreateService ==
   /\ UNCHANGED << tasks, nodes, nEvents >>
-  /\ \E sid \in ServiceId \ DOMAIN services,  \* `sid' is an unused ServiceId
-       spec \in ServiceSpec :                 \* `spec' is any ServiceSpec
-          services' = services @@ sid :> spec \* Add `sid |-> spec' to `services'
+  /\ \E sid \in ServiceId \ DOMAIN services,     \* `sid' is an unused ServiceId
+       spec \in ServiceSpec :                    \* `spec' is any ServiceSpec
+          /\ spec.remove = FALSE                 \* (not flagged for removal)
+          /\ services' = services @@ sid :> spec \* Add `sid |-> spec' to `services'
 
 (* Update an existing service's spec. *)
 UpdateService ==
   /\ UNCHANGED << tasks, nodes >>
   /\ CountEvent \* Flag as an event for model-checking purposes
-  /\ \E sid     \in DOMAIN services,        \* `sid' is an existing ServiceId
-        newSpec \in ServiceSpec :           \* `newSpec' is any `ServiceSpec'
-      \* You can't change a service's mode:
-      /\ (services[sid].replicas = global) <=> (newSpec.replicas = global)
-      /\ services' = [ services EXCEPT ![sid] = newSpec ]
+  /\ \E sid     \in DOMAIN services,   \* `sid' is an existing ServiceId
+        newSpec \in ServiceSpec :      \* `newSpec' is any `ServiceSpec'
+       /\ services[sid].remove = FALSE \* We weren't trying to remove sid
+       /\ newSpec.remove = FALSE       \* and we still aren't.
+       \* You can't change a service's mode:
+       /\ (services[sid].replicas = global) <=> (newSpec.replicas = global)
+       /\ services' = [ services EXCEPT ![sid] = newSpec ]
+
+(* The user removes a service.
+
+   Note: Currently, SwarmKit deletes the service from its records immediately.
+   However, this isn't right because we need to wait for the resources to be freed.
+   Here we model the proposed fix, in which we just flag the service for removal. *)
+RemoveService ==
+  /\ UNCHANGED << nodes >>
+  /\ CountEvent
+  /\ \E sid \in DOMAIN services : \* sid is some existing service
+       \* Flag service for removal:
+       /\ services' = [services EXCEPT ![sid].remove = TRUE]
+       \* Flag every task of the service for removal:
+       /\ UpdateTasks([ t \in TasksOf(sid) |->
+                          [t EXCEPT !.desired_state = remove] ])
 
 (* A user action is one of these. *)
 User ==
   \/ CreateService
   \/ UpdateService
-
-(* Removing a service is not currently modelled, as the SwarmKit developers are currently
-   ``working on a change to the service object to flag it for removal, instead of removing it outright''
-
-   TODO: update the model once the new design is available *)
+  \/ RemoveService
 
 =============================================================================
 
@@ -443,6 +458,7 @@ UnusedId(sid, vslot) ==
 CreateSlot ==
   /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E sid \in DOMAIN services :          \* `sid' is an existing service
+     /\ ~services[sid].remove              \* that we're not trying to remove
      (* For replicated tasks, only create as many slots as we need.
         For global tasks, we want all possible vslots (nodes). *)
      /\ IsReplicated(sid) =>
@@ -531,6 +547,14 @@ ReleaseReady ==
              ~Runnable(other)             \* All other tasks have finished
        /\ UpdateTasks(t :> [t EXCEPT !.desired_state = running])
 
+(* The user asked to remove a service, and now all its tasks have been cleaned up. *)
+CleanupService ==
+  /\ UNCHANGED << tasks, nodes, nEvents >>
+  /\ \E sid \in DOMAIN services :
+     /\ services[sid].remove = TRUE
+     /\ TasksOf(sid) = {}
+     /\ services' = [ i \in DOMAIN services \ {sid} |-> services[i] ]
+
 (* Tasks that the orchestrator must always do eventually if it can: *)
 OrchestratorProgress ==
   \/ CreateSlot
@@ -538,6 +562,7 @@ OrchestratorProgress ==
   \/ RequestRemoval
   \/ CleanupTerminated
   \/ ReleaseReady
+  \/ CleanupService
 
 (* All actions that the orchestrator can perform *)
 Orchestrator ==
@@ -933,6 +958,8 @@ TransitionsOK ==
 (* Every service has the right number of running tasks (the system is in the desired state). *)
 InDesiredState ==
   \A sid \in DOMAIN services :
+    \* We're not trying to remove the service:
+    /\ ~services[sid].remove
     \* The service has the correct set of running replicas:
     /\ LET runningTasks  == { t \in TasksOf(sid) : State(t) = running }
            nRunning      == Cardinality(runningTasks)
