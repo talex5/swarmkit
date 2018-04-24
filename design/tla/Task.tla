@@ -3,12 +3,12 @@ get the general idea. This section gives a very brief overview of the syntax.
 
 Declare `x' to be something that changes as the system runs:
 
-VARIABLE x
+  VARIABLE x
 
 Define `Init' to be a state predicate (== means ``is defined to be''):
 
-Init ==
-  x = 0
+  Init ==
+    x = 0
 
 `Init' is true for states in which `x = 0'. This can be used to define
 the possible initial states of the system. For example, the state
@@ -16,9 +16,9 @@ the possible initial states of the system. For example, the state
 
 Define `Next' to be an action:
 
-Next ==
-   /\ x' \in Nat
-   /\ x' > x
+  Next ==
+    /\ x' \in Nat
+    /\ x' > x
 
 An action takes a pair of states, representing an atomic step of the system.
 Unprimed expressions (e.g. `x') refer to the old state, and primed ones to
@@ -37,22 +37,17 @@ model checker. See the model checking section below for details about that.
 
 The rest of the document is organised as follows:
 
-1. Some parameters, types and definitions
-2. How to run the model checker
-3. Actions performed by the user
-4. Actions performed by the components of SwarmKit
-5. The complete system
-6. Properties of the system
+1. Parameters to the model
+2. Types and definitions
+3. How to run the model checker
+4. Actions performed by the user
+5. Actions performed by the components of SwarmKit
+6. The complete system
+7. Properties of the system
 
 -------------------------------- MODULE Task --------------------------------
 
-(* A description of the task model in SwarmKit.
-   Currently, this is mostly based on `design/task_model.md'.
-
-   Note: I am not yet familiar with the SwarmKit code, and this document is likely to
-   have some errors. It is my current guess about the design. I hope that SwarmKit
-   developers will point out the errors.
- *)
+(* A description of the task model in SwarmKit. *)
 
 EXTENDS Integers, TLC, FiniteSets   \* Some libraries we use
 
@@ -88,13 +83,30 @@ ASSUME maxReplicas \in Nat
 Slot == 1..maxReplicas  \* Possible slot numbers
 
 (* A special value (e.g. `-1') indicating that we want one replica running on each node: *)
-global == CHOOSE x : x \notin Slot
+global == CHOOSE x : x \notin Nat
+
+-------------------------------------------------------------------------------
+\* Types, variables and helpers
+
+VARIABLE tasks          \* The set of currently-allocated tasks
+VARIABLE services       \* A map of currently-allocated services, indexed by ServiceId
+VARIABLE nodes          \* Maps nodes to SwarmKit's view of their NodeState
 
 (* The type of a description of a service (a struct/record).
    This is provided by, and only changed by, the user. *)
 ServiceSpec == [
-  replicas : 0..maxReplicas \union {global} \* A count, or `global'
+  (* The replicas field is either a count giving the desired number of replicas,
+     or the special value `global'. *)
+  replicas : 0..maxReplicas \union {global}
 ]
+
+(* A replicated service is one that specifies some number of replicas it wants. *)
+IsReplicated(sid) ==
+  services[sid].replicas \in Nat
+
+(* A global service is one that wants one task running on each node. *)
+IsGlobal(sid) ==
+  services[sid].replicas = global
 
 (* The possible states for a task: *)
 new == "new"
@@ -109,7 +121,7 @@ complete == "complete"
 shutdown == "shutdown"
 failed == "failed"
 rejected == "rejected"
-remove == "remove"
+remove == "remove"      \* Only used as a ``desired state'', not an actual state
 orphaned == "orphaned"
 
 (* Every state has a rank. It is only possible for a task to change
@@ -124,7 +136,7 @@ order == << new, pending, assigned, accepted,
 StateRank(s) == CHOOSE i \in DOMAIN order : order[i] = s
 
 (* Convenient notation for comparing states: *)
-s1 \prec s2   == StateRank(s1) <  StateRank(s2)
+s1 \prec s2   == StateRank(s1) < StateRank(s2)
 s1 \preceq s2 == StateRank(s1) <= StateRank(s2)
 
 (* The set of possible states ({new, pending, ...}): *)
@@ -149,20 +161,35 @@ Task == [
   slot : Slot \union {global}       \* A way of tracking related tasks
 ]
 
-(* The possible states of a node, as recorded by SwarmKit. *)
-nodeUp   == "up"
-nodeDown == "down"
-NodeState == { nodeUp, nodeDown }
-
-VARIABLE tasks          \* The set of currently-allocated tasks
-VARIABLE services       \* A map of currently-allocated services, indexed by ServiceId
-VARIABLE nodes          \* Maps nodes to SwarmKit's view of their NodeState
-
 (* The current state of task `t'. *)
 State(t) == t.status.state
 
 (* A task is runnable if it is running or could become running in the future. *)
 Runnable(t) == State(t) \preceq running
+
+(* TasksOf(sid) is the set of tasks for service `sid'. *)
+TasksOf(sid) ==
+  { t \in tasks : t.service = sid }
+
+(* A task's ``virtual slot'' is its actual slot for replicated services,
+   but its node for global ones. *)
+VSlot(t) ==
+  IF IsReplicated(t.service)
+    THEN t.slot
+    ELSE t.node
+
+(* All tasks of service `sid' in `vslot'. *)
+TasksOfVSlot(sid, vslot) ==
+  { t \in TasksOf(sid) : VSlot(t) = vslot }
+
+(* All vslots of service `sid'. *)
+VSlotsOf(sid) ==
+  { VSlot(t) : t \in TasksOf(sid) }
+
+(* The possible states of a node, as recorded by SwarmKit. *)
+nodeUp   == "up"
+nodeDown == "down"
+NodeState == { nodeUp, nodeDown }
 
 (* The expected type of each variable. TLA+ is an untyped language, but the model checker
    can check that TypeOK is true for every reachable state. *)
@@ -175,10 +202,25 @@ TypeOK ==
   \* Nodes are up or down
   /\ nodes \in [ Node -> NodeState ]
 
--------------------------------------------------------------------------------
-\* Model checking
+(* Update tasks by performing each update in `f', which is a function
+   mapping old tasks to new ones. *)
+UpdateTasks(f) ==
+  /\ Assert(\A t \in DOMAIN f : t \in tasks, "An old task does not exist!")
+  /\ Assert(\A t \in DOMAIN f :
+                LET t2 == f[t]
+                IN                        \* The updated version of `t' must have
+                /\ t.id      = t2.id      \* the same task ID,
+                /\ t.service = t2.service \* the same service ID,
+                /\ VSlot(t)  = VSlot(t2), \* and the same vslot.
+            "An update changes a task's identity!")
+  \* Remove all the old tasks and add the new ones:
+  /\ tasks' = (tasks \ DOMAIN f) \union Range(f)
 
-(* You can test this specification using the TLC model checker.
+-------------------------------------------------------------------------------
+(*
+`^ \textbf{Model checking} ^'
+
+   You can test this specification using the TLC model checker.
    This section describes how to do that. If you don't want to run TLC,
    you can skip this section.
 
@@ -188,13 +230,13 @@ TypeOK ==
    You will be prompted to enter values for the various CONSTANTS.
    A suitable set of initial values is:
 
-   `.
-   Node          <- [ model value ] {n1}
-   ServiceId     <- [ model value ] {s1}
-   TaskId        <- [ model value ] {t1, t2}
-   maxReplicas   <- 1
-   maxTerminated <- 1
-   .'
+      `.
+      Node          <- [ model value ] {n1}
+      ServiceId     <- [ model value ] {s1}
+      TaskId        <- [ model value ] {t1, t2}
+      maxReplicas   <- 1
+      maxTerminated <- 1
+      .'
 
    For the [ model value ] ones, select `Set of model values'.
 
@@ -209,27 +251,38 @@ TypeOK ==
 
    Running the model should report ``No errors''.
 
-   Increasing the number of nodes, services, replicas or terminated tasks
-   will check more of the system, but will be MUCH slower. It may also fail because
-   there aren't enough task IDs - if the final state it shows has all tasks used,
-   try adding more.
+   If the model fails, TLC will show you an example sequence of actions that lead to
+   the failure and you can inspect the state at each step. You can try this out by
+   commenting out any important-looking condition in the model (e.g. the requirement
+   in UpdateService that you can't change the mode of an existing service).
 
-   To make it go faster, you should configure any model sets (e.g. `TaskId') as `symmetry sets'.
-   It will warn that checking temporal properties may not work correctly,
+   Although the above model is very small, it should detect most errors that you might
+   accidentally introduce when modifying the specification. Increasing the number of nodes,
+   services, replicas or terminated tasks will check more behaviours of the system,
+   but will be MUCH slower. It may also fail because there aren't enough task IDs -
+   if the final state it shows has all tasks used, try adding more.
+
+   The rest of this section describes techniques to make model checking faster by reducing
+   the number of states that must be considered in various ways. Feel free to skip it.
+
+`^ \textbf{Symmetry sets} ^'
+
+   You should configure any model sets (e.g. `TaskId') as `symmetry sets'.
+   For example, if you have a model with two nodes {n1, n2} then this tells TLC that
+   two states which are the same except that n1 and n2 are swapped are equivalent
+   and it only needs to continue exploring from one of them.
+   TLC will warn that checking temporal properties may not work correctly,
    but it's much faster and I haven't had any problems with it.
 
-   Another way to speed it up is to reduce the number of failures it must consider.
+`^ \textbf{Limiting the maximum number of setbacks to consider} ^'
+
+   Another way to speed things up is to reduce the number of failures that TLC must consider.
    By default, it checks every possible combination of failures at every point, which
    is very expensive.
    In the `Advanced Options' panel of the model, add a ``Definition Override'' of e.g.
    `maxEvents = 2'. Actions that represent unnecessary extra work (such as the user
    changing the configuration or a worker node going down) are tagged with `CountEvent'.
    Any run of the system cannot have more than `maxEvents' such events.
-
-   If the model fails, TLC will show you an example sequence of actions that lead to
-   the failure and you can inspect the state at each step. You can try this out by
-   commenting out any important-looking condition in the model (e.g. the requirement
-   in UpdateService that you can't change the mode of an existing service).
 *)
 
 \* The number of ``events'' that have occurred (always 0 if we're not keeping track).
@@ -252,7 +305,56 @@ CountEvent ==
     /\ nEvents < maxEvents
     /\ nEvents' = nEvents + 1
 
--------------------------------------------------------------------------------
+(*
+`^ \textbf{Preventing certain failures} ^'
+
+   If you're not interested in some actions then you can block them. For example,
+   adding these two constraints in the ``Action Constraint'' box of the
+   ``Advanced Options'' tab tells TLC not to consider workers going down or
+   workers rejecting tasks as possible actions:
+
+   /\ ~WorkerDown
+   /\ ~RejectTask
+
+`^ \textbf{Sharing TaskIDs} ^'
+
+   In SwarmKit, every task has a unique ID. This requires a large TaskId set, which
+   is a problem for TLC. However, we can share task IDs safely, as long as we can
+   uniquely identify a task with its << serviceId, vslot, taskId >> triple.
+
+   Do do that, add a ``Definition Override'' (under ``Advanced Options'') with
+
+   UnusedId(sid, slot) <- UnusedIdForSlot(sid, slot)
+*)
+
+\* A replacement for UnusedId that only requires task IDs to be unique within their slot.
+UnusedIdForSlot(sid, vslot) ==
+  LET usedIds == { t.id : t \in TasksOfVSlot(sid, vslot) }
+  IN  TaskId \ usedIds
+
+(* When using UnusedIdForSlot, we can cover most behaviours with only enough task IDs
+   for one running task and maxTerminated finished ones. *)
+ASSUME Cardinality(TaskId) >= 1 + maxTerminated
+
+(*
+`^ \textbf{Combining task states} ^'
+
+   A finished task can be either in the `complete' or `failed' state, depending on
+   its exit status. If we have 4 finished tasks, that's 16 different states. For
+   modelling, we might not care about exit codes and we can treat this as a single
+   state with another definition override:
+
+   failed <- complete
+
+   In a similar way, we can combine { assigned, accepted, preparing, ready } into a single
+   state:
+
+   accepted <- assigned
+   preparing <- assigned
+   ready <- assigned
+*)
+
+---------------------------- MODULE User  --------------------------------------------
 \* Actions performed by users
 
 (* Create a new service with any ServiceSpec.
@@ -292,37 +394,14 @@ User ==
 
    TODO: update the model once the new design is available *)
 
--------------------------------------------------------------------------------
+=============================================================================
+
+---------------------------- MODULE Orchestrator ----------------------------
+
 \* Actions performed the orchestrator
 
-(* Note: This is by far the most complicated component in the model. You might want to read this section last... *)
-
-(* A replicated service is one that specifies some number of replicas it wants. *)
-IsReplicated(sid) ==
-  services[sid].replicas \in Nat
-
-(* A global service is one that wants one task running on each node. *)
-IsGlobal(sid) ==
-  services[sid].replicas = global
-
-(* TasksOf(sid) is the set of tasks for service `sid'. *)
-TasksOf(sid) ==
-  { t \in tasks : t.service = sid }
-
-(* A task's ``virtual slot'' is its actual slot for replicated services,
-   but its node for global ones. *)
-VSlot(t) ==
-  IF IsReplicated(t.service)
-    THEN t.slot
-    ELSE t.node
-
-(* All tasks of service `sid' in `vslot'. *)
-TasksOfVSlot(sid, vslot) ==
-  { t \in TasksOf(sid) : VSlot(t) = vslot }
-
-(* All vslots of service `sid'. *)
-VSlotsOf(sid) ==
-  { VSlot(t) : t \in TasksOf(sid) }
+\* Note: This is by far the most complicated component in the model.
+\* You might want to read this section last...
 
 (* The set of tasks for service `sid' that should be considered as active.
    This is any task that is running or on its way to running. *)
@@ -344,19 +423,6 @@ NewTask(sid, vslot, id, desired_state) ==
     node          |-> IF IsReplicated(sid) THEN unassigned ELSE vslot,
     slot          |-> IF IsGlobal(sid)     THEN global     ELSE vslot
   ]
-
-(* Update tasks by performing each update in `f', which is a function
-   mapping old tasks to new ones. *)
-UpdateTasks(f) ==
-  /\ Assert(\A t \in DOMAIN f : t \in tasks, "An old task does not exist!")
-  /\ Assert(\A t \in DOMAIN f :
-                LET t2 == f[t]
-                IN
-                /\ t.id      = t2.id
-                /\ t.service = t2.service
-                /\ VSlot(t)  = VSlot(t2),
-            "An update changes a task's identity!")
-  /\ tasks' = (tasks \ DOMAIN f) \union Range(f)
 
 (* The set of possible new vslots for `sid'. *)
 UnusedVSlot(sid) ==
@@ -431,7 +497,10 @@ CleanupTerminated ==
         UpdateTasks(t :> [t EXCEPT !.desired_state = remove])
 
 (* We don't model the updater explicitly, but we allow any task to be restarted (perhaps with
-   a different image) at any time, which should cover the behaviours of the restart supervisor. *)
+   a different image) at any time, which should cover the behaviours of the restart supervisor.
+
+   XXX: wait for new task to be ready before shutting down old one?
+*)
 RestartTask ==
   /\ UNCHANGED << services, nodes >>
   /\ CountEvent
@@ -475,7 +544,9 @@ Orchestrator ==
   \/ OrchestratorProgress
   \/ RestartTask
 
--------------------------------------------------------------------------------
+=============================================================================
+
+---------------------------- MODULE Allocator -------------------------------
 \*  Actions performed the allocator
 
 (* Pick a `new' task and move it to `pending'.
@@ -506,7 +577,10 @@ Allocator ==
   \/ AllocatorProgress
   \/ RejectAllocation
 
--------------------------------------------------------------------------------
+=============================================================================
+
+---------------------------- MODULE Scheduler -------------------------------
+
 \*  Actions performed the scheduler
 
 (* The scheduler assigns a node to a `pending' task and moves it to `assigned'
@@ -523,7 +597,10 @@ Scheduler ==
            UpdateTasks(t :> [t EXCEPT !.status.state = assigned,
                                       !.node = node ])
 
--------------------------------------------------------------------------------
+=============================================================================
+
+---------------------------- MODULE Agent -----------------------------------
+
 \*  Actions performed by worker nodes (actually, by the dispatcher on their behalf)
 
 (* SwarmKit thinks the node is up. i.e. the agent is connected to a manager. *)
@@ -638,7 +715,10 @@ Agent ==
   \/ ContainerExit
   \/ WorkerDown
 
--------------------------------------------------------------------------------
+=============================================================================
+
+---------------------------- MODULE Reaper ----------------------------------
+
 \*  Actions performed by the reaper
 
 (* Forget about tasks in remove or orphan states.
@@ -656,8 +736,17 @@ Reaper ==
          \/ State(t) = orphaned
       /\ tasks' = tasks \ {t}
 
--------------------------------------------------------------------------------
+=============================================================================
+
 \*  The complete system
+
+\* Import definitions from the various modules
+INSTANCE User
+INSTANCE Orchestrator
+INSTANCE Allocator
+INSTANCE Scheduler
+INSTANCE Agent
+INSTANCE Reaper
 
 \* All the variables
 vars == << tasks, services, nodes, nEvents >>
@@ -711,6 +800,14 @@ Spec ==
 (* These are properties that should follow automatically if the system behaves as
    described by `Spec' in the previous section. *)
 
+\* A unique identifier for a task, which never changes.
+Id(t) ==
+  (* In the real system, this could just be t.id as IDs are unique.
+     However, when modelling we may decide to share IDs, so we use
+     this triple to uniquely identify a task. See UnusedIdForSlot
+     for details. *)
+  << t.service, VSlot(t), t.id >>
+
 \* A state invariant (things that should be true in every state).
 Inv ==
   \A t \in tasks :
@@ -724,7 +821,7 @@ Inv ==
     \* `remove' is only used as a desired state, not an actual one:
     /\ State(t) # remove
     \* Task IDs are unique
-    /\ \A t2 \in tasks : t.id = t2.id => t = t2
+    /\ \A t2 \in tasks : Id(t) = Id(t2) => t = t2
 
 \* A special ``state'' used when a task doesn't exist.
 null == "null"
@@ -795,16 +892,17 @@ TransitionTableOK ==
 
 ASSUME TransitionTableOK  \* Note: ASSUME means ``check'' to TLC
 
-IdSet(S) == { x.id : x \in S }
+(* The IDs of a set of tasks. *)
+IdSet(S) == { Id(t) : t \in S }
 
 (* The state of task `i' in `S', or `null' if it doesn't exist *)
 Get(S, i) ==
-  LET cand == { x \in S : x.id = i }
+  LET cand == { x \in S : Id(x) = i }
   IN  IF cand = {} THEN null
                    ELSE State(CHOOSE x \in cand : TRUE)
 
 (* An action in which all transitions were valid. *)
-TransitionOK ==
+StepTransitionsOK ==
   LET permitted == { << x, x >> : x \in TaskState } \union  \* No change is always OK
     CASE Orchestrator -> Transitions.orchestrator
       [] Allocator    -> Transitions.allocator
@@ -828,9 +926,9 @@ TransitionOK ==
    `x=3' on its own means that `x=3' in the initial state.
 *)
 
-\* A temporal formula that checks transitions
+\* A temporal formula that checks every step satisfies StepTransitionsOK (or `vars' is unchanged)
 TransitionsOK ==
-  /\ [][TransitionOK]_vars      \* Every step satisfies TransitionOK (or leaves `vars' unchanged)
+  [][StepTransitionsOK]_vars
 
 (* Every service has the right number of running tasks (the system is in the desired state). *)
 InDesiredState ==
