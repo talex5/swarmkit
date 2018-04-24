@@ -757,7 +757,8 @@ Agent ==
 Reaper ==
   /\ UNCHANGED << services, nodes, nEvents >>
   /\ \E t \in tasks :
-      /\ \/ (~Runnable(t) /\ t.desired_state = remove)
+      /\ \/ /\ t.desired_state = remove
+            /\ (State(t) \prec assigned \/ ~Runnable(t)) \* Not owned by agent
          \/ State(t) = orphaned
       /\ tasks' = tasks \ {t}
 
@@ -893,6 +894,8 @@ Transitions == [
   },
 
   reaper |-> {
+    << new, null >>,
+    << pending, null >>,
     << rejected, null >>,
     << complete, null >>,
     << failed, null >>,
@@ -909,9 +912,12 @@ TransitionTableOK ==
         \/ s1 = null
         \/ s2 = null
         \/ s1 \preceq s2
-  \* Every source state has exactly one component which handles transitions out of that state:
+  (* Every source state has exactly one component which handles transitions out of that state.
+     Except for the case of the reaper removing `new' and `pending' tasks that are flagged
+     for removal. *)
   /\ \A a1, a2 \in DOMAIN Transitions :
-     LET Source(a) == { s[1] : s \in Transitions[a] }
+     LET exceptions == { << new, null >>, << pending, null >> }
+          Source(a) == { s[1] : s \in Transitions[a] \ exceptions}
      IN  a1 # a2 =>
            Source(a1) \intersect Source(a2) = {}
 
