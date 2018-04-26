@@ -73,9 +73,14 @@ CONSTANT ServiceId
 (* The type of task IDs. *)
 CONSTANT TaskId
 
-\* The maximum number of terminated tasks to keep for each slot:
+(* The maximum number of terminated tasks to keep for each slot. *)
 CONSTANT maxTerminated
 ASSUME maxTerminated \in Nat
+
+(* In the model, we share taskIDs (see ModelTaskId), which means that
+   we can cover most behaviours with only enough task IDs
+   for one running task and maxTerminated finished ones. *)
+ASSUME Cardinality(TaskId) >= 1 + maxTerminated
 
 \* The maximum possible value for `replicas' in ServiceSpec:
 CONSTANT maxReplicas
@@ -175,9 +180,7 @@ TasksOf(sid) ==
 (* A task's ``virtual slot'' is its actual slot for replicated services,
    but its node for global ones. *)
 VSlot(t) ==
-  IF IsReplicated(t.service)
-    THEN t.slot
-    ELSE t.node
+  IF t.slot = global THEN t.node ELSE t.slot
 
 (* All tasks of service `sid' in `vslot'. *)
 TasksOfVSlot(sid, vslot) ==
@@ -191,6 +194,19 @@ VSlotsOf(sid) ==
 nodeUp   == "up"
 nodeDown == "down"
 NodeState == { nodeUp, nodeDown }
+
+(* In the real SwarmKit, a task's ID is just its taskId field.
+   However, this requires lots of IDs, which is expensive for model checking.
+   So instead, we will identify tasks by their << serviceId, vSlot, taskId >>
+   triple, and only require taskId to be unique within its vslot. *)
+ModelTaskId == ServiceId \X (Slot \union Node) \X TaskId
+
+(* A unique identifier for a task, which never changes. *)
+Id(t) ==
+  << t.service, VSlot(t), t.id >>   \* A ModelTaskId
+
+(* The ModelTaskIds of a set of tasks. *)
+IdSet(S) == { Id(t) : t \in S }
 
 (* The expected type of each variable. TLA+ is an untyped language, but the model checker
    can check that TypeOK is true for every reachable state. *)
@@ -316,26 +332,7 @@ CountEvent ==
 
    /\ ~WorkerDown
    /\ ~RejectTask
-
-`^ \textbf{Sharing TaskIDs} ^'
-
-   In SwarmKit, every task has a unique ID. This requires a large TaskId set, which
-   is a problem for TLC. However, we can share task IDs safely, as long as we can
-   uniquely identify a task with its << serviceId, vslot, taskId >> triple.
-
-   Do do that, add a ``Definition Override'' (under ``Advanced Options'') with
-
-   UnusedId(sid, slot) <- UnusedIdForSlot(sid, slot)
 *)
-
-\* A replacement for UnusedId that only requires task IDs to be unique within their slot.
-UnusedIdForSlot(sid, vslot) ==
-  LET usedIds == { t.id : t \in TasksOfVSlot(sid, vslot) }
-  IN  TaskId \ usedIds
-
-(* When using UnusedIdForSlot, we can cover most behaviours with only enough task IDs
-   for one running task and maxTerminated finished ones. *)
-ASSUME Cardinality(TaskId) >= 1 + maxTerminated
 
 (*
 `^ \textbf{Combining task states} ^'
@@ -435,8 +432,8 @@ NewTask(sid, vslot, id, desired_state) ==
     service       |-> sid,
     status        |-> [ state |-> new ],
     desired_state |-> desired_state,
-    node          |-> IF IsReplicated(sid) THEN unassigned ELSE vslot,
-    slot          |-> IF IsGlobal(sid)     THEN global     ELSE vslot
+    node          |-> IF vslot \in Node THEN vslot ELSE unassigned,
+    slot          |-> IF vslot \in Slot THEN vslot ELSE global
   ]
 
 (* The set of possible new vslots for `sid'. *)
@@ -446,13 +443,12 @@ UnusedVSlot(sid) ==
 
 (* The set of possible IDs for a new task in a vslot.
 
-   This is just the set of unallocated IDs globally -- we don't care
-   about `sid' and `vslot'.
-   However, for modelling purposes it may be useful to override this.
- *)
+   The complexity here is just a side-effect of the modelling (where we need to
+   share and reuse task IDs for performance).
+   In the real system, choosing an unused ID is easy. *)
 UnusedId(sid, vslot) ==
-  LET usedIds == { t.id : t \in tasks }
-  IN  TaskId \ usedIds
+  LET swarmTaskIds == { t.id : t \in TasksOfVSlot(sid, vslot) }
+  IN  TaskId \ swarmTaskIds
 
 (* Create a new task/slot if the number of runnable tasks is less than the number requested. *)
 CreateSlot ==
@@ -826,14 +822,6 @@ Spec ==
 (* These are properties that should follow automatically if the system behaves as
    described by `Spec' in the previous section. *)
 
-\* A unique identifier for a task, which never changes.
-Id(t) ==
-  (* In the real system, this could just be t.id as IDs are unique.
-     However, when modelling we may decide to share IDs, so we use
-     this triple to uniquely identify a task. See UnusedIdForSlot
-     for details. *)
-  << t.service, VSlot(t), t.id >>
-
 \* A state invariant (things that should be true in every state).
 Inv ==
   \A t \in tasks :
@@ -922,9 +910,6 @@ TransitionTableOK ==
            Source(a1) \intersect Source(a2) = {}
 
 ASSUME TransitionTableOK  \* Note: ASSUME means ``check'' to TLC
-
-(* The IDs of a set of tasks. *)
-IdSet(S) == { Id(t) : t \in S }
 
 (* The state of task `i' in `S', or `null' if it doesn't exist *)
 Get(S, i) ==
