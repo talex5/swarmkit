@@ -45,33 +45,15 @@ The rest of the document is organised as follows:
 6. The complete system
 7. Properties of the system
 
--------------------------------- MODULE Task --------------------------------
+-------------------------------- MODULE SwarmKit --------------------------------
 
-(* A description of the task model in SwarmKit. *)
-
-EXTENDS Integers, TLC, FiniteSets   \* Some libraries we use
-
-(* A generic operator to get the range of a function (the set of values in a map): *)
-Range(S) == { S[i] : i \in DOMAIN S }
-
-(* The set of worker nodes.
-
-   Note: a CONSTANT is an input to the model. The model should work with any set of nodes you provide.
-
-   TODO: should cope with this changing at runtime, and with draining nodes. *)
-CONSTANT Node
-
-(* A special value indicating that a task is not yet assigned to a node.
-
-   Note: this TLA+ CHOOSE idiom just says to pick some value that isn't a Node (e.g. `null'). *)
-unassigned == CHOOSE n : n \notin Node
-
-(* The type (set) of service IDs (e.g. `Int' or `String').
-   When model checking, this will be some small set (e.g. {"s1", "s2"}). *)
-CONSTANT ServiceId
-
-(* The type of task IDs. *)
-CONSTANT TaskId
+(* Import some libraries we use.
+   Common SwarmKit types are defined in Types.tla. You should probably read that before continuing. *)
+EXTENDS Integers, TLC, FiniteSets,  \* From the TLA+ standard library
+        Types,                      \* SwarmKit types
+        Tasks,                      \* The `tasks' variable
+        WorkerSpec,                 \* High-level spec for worker nodes
+        EventCounter                \* Event limiting, for modelling purposes
 
 (* The maximum number of terminated tasks to keep for each slot. *)
 CONSTANT maxTerminated
@@ -82,29 +64,10 @@ ASSUME maxTerminated \in Nat
    for one running task and maxTerminated finished ones. *)
 ASSUME Cardinality(TaskId) >= 1 + maxTerminated
 
-\* The maximum possible value for `replicas' in ServiceSpec:
-CONSTANT maxReplicas
-ASSUME maxReplicas \in Nat
-Slot == 1..maxReplicas  \* Possible slot numbers
-
-(* A special value (e.g. `-1') indicating that we want one replica running on each node: *)
-global == CHOOSE x : x \notin Nat
-
 -------------------------------------------------------------------------------
-\* Types, variables and helpers
+\* Services
 
-VARIABLE tasks          \* The set of currently-allocated tasks
 VARIABLE services       \* A map of currently-allocated services, indexed by ServiceId
-VARIABLE nodes          \* Maps nodes to SwarmKit's view of their NodeState
-
-(* The type of a description of a service (a struct/record).
-   This is provided by, and only changed by, the user. *)
-ServiceSpec == [
-  (* The replicas field is either a count giving the desired number of replicas,
-     or the special value `global'. *)
-  replicas : 0..maxReplicas \union {global},
-  remove   : BOOLEAN    \* The user wants to remove this service
-]
 
 (* A replicated service is one that specifies some number of replicas it wants. *)
 IsReplicated(sid) ==
@@ -114,73 +77,9 @@ IsReplicated(sid) ==
 IsGlobal(sid) ==
   services[sid].replicas = global
 
-(* The possible states for a task: *)
-new == "new"
-pending == "pending"
-assigned == "assigned"
-accepted == "accepted"
-preparing == "preparing"
-ready == "ready"
-starting == "starting"
-running == "running"
-complete == "complete"
-shutdown == "shutdown"
-failed == "failed"
-rejected == "rejected"
-remove == "remove"      \* Only used as a ``desired state'', not an actual state
-orphaned == "orphaned"
-
-(* Every state has a rank. It is only possible for a task to change
-   state to a state with a higher rank (later in this sequence). *)
-order == << new, pending, assigned, accepted,
-             preparing, ready, starting,
-             running,
-             complete, shutdown, failed, rejected,
-             remove, orphaned >>
-
-(* Maps a state to its position in `order' (e.g. StateRank(new) = 1): *)
-StateRank(s) == CHOOSE i \in DOMAIN order : order[i] = s
-
-(* Convenient notation for comparing states: *)
-s1 \prec s2   == StateRank(s1) < StateRank(s2)
-s1 \preceq s2 == StateRank(s1) <= StateRank(s2)
-
-(* The set of possible states ({new, pending, ...}): *)
-TaskState == Range(order)
-
-(* Possibly this doesn't need to be a record, but we might want to add extra fields later. *)
-TaskStatus == [
-  state : TaskState
-]
-
-(* This has every field mentioned in `task_model.md' except for `spec', which
-   it doesn't seem to use for anything.
-
-   `desired_state' can be any state, although currently we only ever set it to one of
-    {ready, running, shutdown, remove}. *)
-Task == [
-  id : TaskId,                      \* To uniquely identify this task
-  service : ServiceId,              \* The service that owns the task
-  status : TaskStatus,              \* The current state
-  desired_state : TaskState,        \* The state requested by the orchestrator
-  node : Node \union {unassigned},  \* The node on which the task should be run
-  slot : Slot \union {global}       \* A way of tracking related tasks
-]
-
-(* The current state of task `t'. *)
-State(t) == t.status.state
-
-(* A task is runnable if it is running or could become running in the future. *)
-Runnable(t) == State(t) \preceq running
-
 (* TasksOf(sid) is the set of tasks for service `sid'. *)
 TasksOf(sid) ==
   { t \in tasks : t.service = sid }
-
-(* A task's ``virtual slot'' is its actual slot for replicated services,
-   but its node for global ones. *)
-VSlot(t) ==
-  IF t.slot = global THEN t.node ELSE t.slot
 
 (* All tasks of service `sid' in `vslot'. *)
 TasksOfVSlot(sid, vslot) ==
@@ -190,48 +89,17 @@ TasksOfVSlot(sid, vslot) ==
 VSlotsOf(sid) ==
   { VSlot(t) : t \in TasksOf(sid) }
 
-(* The possible states of a node, as recorded by SwarmKit. *)
-nodeUp   == "up"
-nodeDown == "down"
-NodeState == { nodeUp, nodeDown }
-
-(* In the real SwarmKit, a task's ID is just its taskId field.
-   However, this requires lots of IDs, which is expensive for model checking.
-   So instead, we will identify tasks by their << serviceId, vSlot, taskId >>
-   triple, and only require taskId to be unique within its vslot. *)
-ModelTaskId == ServiceId \X (Slot \union Node) \X TaskId
-
-(* A unique identifier for a task, which never changes. *)
-Id(t) ==
-  << t.service, VSlot(t), t.id >>   \* A ModelTaskId
-
-(* The ModelTaskIds of a set of tasks. *)
-IdSet(S) == { Id(t) : t \in S }
+-------------------------------------------------------------------------------
+\* Types
 
 (* The expected type of each variable. TLA+ is an untyped language, but the model checker
    can check that TypeOK is true for every reachable state. *)
 TypeOK ==
-  \* `tasks' is a subset of the set of all possible tasks
-  /\ tasks \in SUBSET Task
   \* `services' is a mapping from service IDs to ServiceSpecs:
   /\ DOMAIN services \subseteq ServiceId
   /\ services \in [ DOMAIN services -> ServiceSpec ]
-  \* Nodes are up or down
-  /\ nodes \in [ Node -> NodeState ]
-
-(* Update tasks by performing each update in `f', which is a function
-   mapping old tasks to new ones. *)
-UpdateTasks(f) ==
-  /\ Assert(\A t \in DOMAIN f : t \in tasks, "An old task does not exist!")
-  /\ Assert(\A t \in DOMAIN f :
-                LET t2 == f[t]
-                IN                        \* The updated version of `t' must have
-                /\ t.id      = t2.id      \* the same task ID,
-                /\ t.service = t2.service \* the same service ID,
-                /\ VSlot(t)  = VSlot(t2), \* and the same vslot.
-            "An update changes a task's identity!")
-  \* Remove all the old tasks and add the new ones:
-  /\ tasks' = (tasks \ DOMAIN f) \union Range(f)
+  /\ TasksTypeOK    \* Defined in Types.tla
+  /\ WorkerTypeOK   \* Defined in WorkerSpec.tla
 
 -------------------------------------------------------------------------------
 (*
@@ -300,29 +168,9 @@ UpdateTasks(f) ==
    `maxEvents = 2'. Actions that represent unnecessary extra work (such as the user
    changing the configuration or a worker node going down) are tagged with `CountEvent'.
    Any run of the system cannot have more than `maxEvents' such events.
-*)
 
-\* The number of ``events'' that have occurred (always 0 if we're not keeping track).
-VARIABLE nEvents
+   See `EventCounter.tla' for details.
 
-\* The maximum number of events to allow, or ``-1'' for unlimited.
-maxEvents == -1
-
-InitEvents ==
-  nEvents = 0       \* Start with the counter at zero
-
-(* If we're counting events, increment the event counter.
-   We don't increment the counter when we don't have a maximum because that
-   would make the model infinite.
-   Actions tagged with CountEvent cannot happen once nEvents = maxEvents. *)
-CountEvent ==
-  IF maxEvents = -1 THEN
-    UNCHANGED nEvents
-  ELSE
-    /\ nEvents < maxEvents
-    /\ nEvents' = nEvents + 1
-
-(*
 `^ \textbf{Preventing certain failures} ^'
 
    If you're not interested in some actions then you can block them. For example,
@@ -424,17 +272,6 @@ RunnableTasks(sid) ==
    towards the total count when deciding whether we need to kill anything. *)
 RunnableWantedTasks(sid) ==
   { t \in RunnableTasks(sid) : t.desired_state \preceq running  }
-
-(* A `new' task belonging to service `sid' with the given slot, id, and desired state. *)
-NewTask(sid, vslot, id, desired_state) ==
-  [
-    id            |-> id,
-    service       |-> sid,
-    status        |-> [ state |-> new ],
-    desired_state |-> desired_state,
-    node          |-> IF vslot \in Node THEN vslot ELSE unassigned,
-    slot          |-> IF vslot \in Slot THEN vslot ELSE global
-  ]
 
 (* The set of possible new vslots for `sid'. *)
 UnusedVSlot(sid) ==
@@ -620,124 +457,6 @@ Scheduler ==
 
 =============================================================================
 
----------------------------- MODULE Agent -----------------------------------
-
-\*  Actions performed by worker nodes (actually, by the dispatcher on their behalf)
-
-(* SwarmKit thinks the node is up. i.e. the agent is connected to a manager. *)
-IsUp(n) == nodes[n] = nodeUp
-
-(* Try to advance containers towards `desired_state' if we're not there yet. *)
-ProgressTask ==
-  /\ UNCHANGED << services, nodes, nEvents >>
-  /\ \E t  \in tasks,
-        s2 \in TaskState :   \* The state we want to move to
-        LET t2 == [t EXCEPT !.status.state = s2]
-        IN
-        /\ s2 \preceq t.desired_state       \* Can't be after the desired state
-        /\ << State(t), State(t2) >> \in {  \* Possible ``progress'' (desirable) transitions
-             << assigned, accepted >>,
-             << accepted, preparing >>,
-             << preparing, ready >>,
-             << ready, starting >>,
-             << starting, running >>
-           }
-        /\ IsUp(t.node)                     \* Node must be connected to SwarmKit
-        /\ UpdateTasks(t :> t2)
-
-(* A running container finishes because we stopped it. *)
-ShutdownComplete ==
-  /\ UNCHANGED << services, nodes, nEvents >>
-  /\ \E t \in tasks :
-     /\ t.desired_state \in {shutdown, remove}                  \* We are trying to stop it
-     /\ State(t) = running                                      \* It is currently running
-     /\ IsUp(t.node)
-     /\ UpdateTasks(t :> [t EXCEPT !.status.state = shutdown])  \* It becomes shutdown
-
-(* A node can reject a task once it's responsible for it (it has reached `assigned')
-   until it reaches the `running' state.
-   Note that an ``accepted'' task can still be rejected. *)
-RejectTask ==
-  /\ UNCHANGED << services, nodes >>
-  /\ CountEvent
-  /\ \E t \in tasks :
-       /\ State(t) \in { assigned, accepted, preparing, ready, starting }
-       /\ IsUp(t.node)
-       /\ UpdateTasks(t :> [t EXCEPT !.status.state = rejected])
-
-(* A running container finishes running on its own.
-
-   TODO: we should model the actual state of containers separately from
-   the SwarmKit manager's record of their states. *)
-ContainerExit ==
-  /\ UNCHANGED << services, nodes >>
-  /\ CountEvent
-  /\ \E t  \in tasks,
-        s2 \in {failed, complete} :      \* Either a successful or failed exit status
-        /\ State(t) = running
-        /\ IsUp(t.node)
-        /\ UpdateTasks(t :> [t EXCEPT !.status.state = s2])
-
-(* Tasks assigned to a node and for which the node is responsible. *)
-TasksOwnedByNode(n) == { t \in tasks :
-  /\ t.node = n
-  /\ assigned \preceq State(t)
-  /\ State(t) \prec remove
-}
-
-(* The dispatcher notices that the worker is down (the connection is lost). *)
-WorkerDown ==
-  /\ UNCHANGED << tasks, services >>
-  /\ CountEvent
-  /\ \E n \in Node :
-       /\ IsUp(n)
-       /\ nodes' = [nodes EXCEPT ![n] = nodeDown]
-
-(* When the node reconnects to the cluster, it gets an assignment set from the dispatcher
-   which does not include any tasks that have been marked orphaned and then deleted.
-   Any time an agent gets an assignment set that does not include some task it has running,
-   it shuts down those tasks.
-
-   Currently, we don't model the state of the tasks on the node separately from the SwarmKit
-   state. *)
-WorkerUp ==
-  /\ UNCHANGED << tasks, services, nEvents >>
-  /\ \E n \in Node :
-       /\ ~IsUp(n)
-       /\ nodes' = [nodes EXCEPT ![n] = nodeUp]
-
-(* If SwarmKit sees a node as down for a long time (48 hours or so) then
-   it marks all the node's tasks as orphaned.
-
-   ``Moving a task to the Orphaned state is not desirable,
-   because it's the one case where we break the otherwise invariant
-   that the agent sets all states past ASSIGNED.''
-*)
-OrphanTasks ==
-  /\ UNCHANGED << services, nodes, nEvents >>
-  /\ \E n \in Node :
-       LET affected == { t \in TasksOwnedByNode(n) : Runnable(t) }
-       IN
-       /\ ~IsUp(n)    \* Node `n' is still detected as down
-       /\ UpdateTasks([ t \in affected |->
-                         [t EXCEPT !.status.state = orphaned] ])
-
-(* Actions we require to happen eventually when possible. *)
-AgentProgress ==
-  \/ ProgressTask
-  \/ ShutdownComplete
-  \/ OrphanTasks
-  \/ WorkerUp
-
-(* All actions of the agent/worker. *)
-Agent ==
-  \/ AgentProgress
-  \/ RejectTask
-  \/ ContainerExit
-  \/ WorkerDown
-
-=============================================================================
-
 ---------------------------- MODULE Reaper ----------------------------------
 
 \*  Actions performed by the reaper
@@ -767,7 +486,6 @@ INSTANCE User
 INSTANCE Orchestrator
 INSTANCE Allocator
 INSTANCE Scheduler
-INSTANCE Agent
 INSTANCE Reaper
 
 \* All the variables
@@ -780,13 +498,35 @@ Init ==
   /\ nodes = [ n \in Node |-> nodeUp ]
   /\ InitEvents
 
+(* WorkerSpec doesn't mention `services'. To combine it with this spec, we need to say
+   that every action of the agent leaves `services' unchanged. *)
+AgentReal ==
+  Agent /\ UNCHANGED services
+
+(* Unfortunately, `AgentReal' causes TLC to report all problems of the agent
+   as simply `AgentReal' steps, which isn't very helpful. We can get better
+   diagnostics by expanding it, like this: *)
+AgentTLC ==
+  \/ (ProgressTask     /\ UNCHANGED services)
+  \/ (ShutdownComplete /\ UNCHANGED services)
+  \/ (OrphanTasks      /\ UNCHANGED services)
+  \/ (WorkerUp         /\ UNCHANGED services)
+  \/ (RejectTask       /\ UNCHANGED services)
+  \/ (ContainerExit    /\ UNCHANGED services)
+  \/ (WorkerDown       /\ UNCHANGED services)
+
+(* To avoid the risk of `AgentTLC' getting out of sync,
+   TLAPS can check that the definitions are equivalent. *)
+THEOREM AgentTLC = AgentReal
+BY DEF AgentTLC, AgentReal, Agent, AgentProgress
+
 (* A next step is one in which any of these sub-components takes a step: *)
 Next ==
   \/ User
   \/ Orchestrator
   \/ Allocator
   \/ Scheduler
-  \/ Agent
+  \/ AgentTLC
   \/ Reaper
   \* For model checking: don't report deadlock if we're limiting events
   \/ (nEvents = maxEvents /\ UNCHANGED vars)
@@ -806,9 +546,9 @@ Spec ==
   /\ WF_vars(OrchestratorProgress)
   /\ WF_vars(AllocatorProgress)
   /\ WF_vars(Scheduler)
-  /\ WF_vars(AgentProgress)
+  /\ WF_vars(AgentProgress /\ UNCHANGED services)
   /\ WF_vars(Reaper)
-  /\ WF_vars(WorkerUp)
+  /\ WF_vars(WorkerUp /\ UNCHANGED services)
      (* We don't require fairness of:
         - User (we don't control them),
         - RestartTask (services aren't required to be updated),
@@ -836,80 +576,6 @@ Inv ==
     /\ State(t) # remove
     \* Task IDs are unique
     /\ \A t2 \in tasks : Id(t) = Id(t2) => t = t2
-
-\* A special ``state'' used when a task doesn't exist.
-null == "null"
-
-(* All the possible transitions, grouped by the component that performs them. *)
-Transitions == [
-  orchestrator |-> {
-    << null, new >>
-  },
-
-  allocator |-> {
-    << new, pending >>,
-    << new, rejected >>
-  },
-
-  scheduler |-> {
-    << pending, assigned >>
-  },
-
-  agent |-> {
-    << assigned, accepted >>,
-    << accepted, preparing >>,
-    << preparing, ready >>,
-    << ready, starting >>,
-    << starting, running >>,
-
-    << assigned, rejected >>,
-    << accepted, rejected >>,
-    << preparing, rejected >>,
-    << ready, rejected >>,
-    << starting, rejected >>,
-
-    << running, complete >>,
-    << running, failed >>,
-
-    << running, shutdown >>,
-
-    << assigned, orphaned >>,
-    << accepted, orphaned >>,
-    << preparing, orphaned >>,
-    << ready, orphaned >>,
-    << starting, orphaned >>,
-    << running, orphaned >>
-  },
-
-  reaper |-> {
-    << new, null >>,
-    << pending, null >>,
-    << rejected, null >>,
-    << complete, null >>,
-    << failed, null >>,
-    << shutdown, null >>,
-    << orphaned, null >>
-  }
-]
-
-(* Check that `Transitions' itself is OK. *)
-TransitionTableOK ==
-  \* No transition moves to a lower-ranked state:
-  /\ \A actor \in DOMAIN Transitions :
-     \A << s1, s2 >> \in Transitions[actor] :
-        \/ s1 = null
-        \/ s2 = null
-        \/ s1 \preceq s2
-  (* Every source state has exactly one component which handles transitions out of that state.
-     Except for the case of the reaper removing `new' and `pending' tasks that are flagged
-     for removal. *)
-  /\ \A a1, a2 \in DOMAIN Transitions :
-     LET exceptions == { << new, null >>, << pending, null >> }
-          Source(a) == { s[1] : s \in Transitions[a] \ exceptions}
-     IN  a1 # a2 =>
-           Source(a1) \intersect Source(a2) = {}
-
-ASSUME TransitionTableOK  \* Note: ASSUME means ``check'' to TLC
 
 (* The state of task `i' in `S', or `null' if it doesn't exist *)
 Get(S, i) ==
