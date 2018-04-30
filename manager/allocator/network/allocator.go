@@ -233,7 +233,9 @@ func (a *allocator) AllocateService(service *api.Service) error {
 		if service.SpecVersion != nil {
 			newVersion = service.SpecVersion.Index
 		}
-		if oldVersion == newVersion {
+		// If the version is older than what we already have, then the service
+		// is fully allocated already
+		if oldVersion >= newVersion {
 			return errors.ErrAlreadyAllocated()
 		}
 	}

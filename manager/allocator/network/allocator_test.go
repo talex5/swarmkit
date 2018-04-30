@@ -160,25 +160,13 @@ var _ = Describe("network.Allocator", func() {
 				// gomock doing its thing.
 			})
 			It("should mark service 0 & 1 as fully allocated, and not service 2", func() {
-				// try to allocate service 0, which should return
-				// ErrAlreadyAllocated
-				err := a.AllocateService(initServices[0])
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(WithTransform(errors.IsErrAlreadyAllocated, BeTrue()))
-
-				// try to allocate service 1, which should also return
-				// ErrAlreadyAllocated
-				err = a.AllocateService(initServices[1])
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(WithTransform(errors.IsErrAlreadyAllocated, BeTrue()))
-
-				// set up gomock to return a call to the ipam allocator with
-				// whatever, and return an error (so we'll know we haven't gotten
-				// ErrAlreadyAllocated)
-				mockPort.EXPECT().Allocate(gomock.Any(), gomock.Any()).Return(nil, errors.ErrInternal("foo"))
-				err = a.AllocateService(initServices[2])
-				Expect(err).To(HaveOccurred())
-				Expect(err).ToNot(WithTransform(errors.IsErrAlreadyAllocated, BeTrue()))
+				Expect(a.services).To(And(
+					HaveKey("service0"),
+					HaveKey("service1"),
+					Not(HaveKey("service2")),
+				))
+				Expect(a.services["service0"]).To(Equal(initServices[0]))
+				Expect(a.services["service1"]).To(Equal(initServices[1]))
 			})
 		})
 		Context("when some tasks are allocated", func() {
@@ -341,50 +329,204 @@ var _ = Describe("network.Allocator", func() {
 		})
 
 		Describe("allocating networks", func() {
-			Context("successfully", func() {
+			var (
+				net *api.Network
+				err error
+			)
+			BeforeEach(func() {
+				net = &api.Network{
+					ID: "net1",
+				}
+			})
+			JustBeforeEach(func() {
+				err = a.AllocateNetwork(net)
+			})
+			Context("when the network is overlay", func() {
+				BeforeEach(func() {
+					mockDriver.EXPECT().IsNetworkNodeLocal(net).Return(false, nil)
+					mockIpam.EXPECT().AllocateNetwork(net).Return(nil)
+					mockDriver.EXPECT().Allocate(net).Return(nil)
+				})
 				It("should return no error", func() {
+					Expect(err).ToNot(HaveOccurred())
 				})
 			})
 			Context("when the network is node-local", func() {
+				BeforeEach(func() {
+					mockDriver.EXPECT().IsNetworkNodeLocal(net).Return(true, nil)
+					mockDriver.EXPECT().Allocate(net).Return(nil)
+				})
 				It("should not call the IPAM allocator", func() {
+					// covered by mock
+				})
+				It("should return no error", func() {
+					Expect(err).ToNot(HaveOccurred())
 				})
 			})
 			Context("when the network driver is invalid", func() {
+				rerr := errors.ErrInvalidSpec("invalid driver")
+				BeforeEach(func() {
+					mockDriver.EXPECT().IsNetworkNodeLocal(net).Return(false, rerr)
+				})
 				It("should return the error returned by IsNetworkNodeLocal", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(Equal(rerr))
 				})
 				It("should not modify the object", func() {
+					Expect(net).To(Equal(&api.Network{ID: "net1"}))
 				})
 			})
 			Context("when the IPAM allocator returns an error", func() {
+				rerr := errors.ErrInternal("foo")
+				BeforeEach(func() {
+					mockDriver.EXPECT().IsNetworkNodeLocal(net).Return(false, nil)
+					mockIpam.EXPECT().AllocateNetwork(net).Return(rerr)
+				})
 				It("should return the error returned by ipam.AllocateNetwork", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(Equal(rerr))
 				})
 				It("should not modify the object", func() {
+					Expect(net).To(Equal(&api.Network{ID: "net1"}))
 				})
 			})
 			Context("when the driver allocator returns an error", func() {
+				rerr := errors.ErrInternal("foo")
+				BeforeEach(func() {
+					mockDriver.EXPECT().IsNetworkNodeLocal(net).Return(false, nil)
+					mockIpam.EXPECT().AllocateNetwork(net).Return(nil)
+					mockDriver.EXPECT().Allocate(net).Return(rerr)
+					mockIpam.EXPECT().DeallocateNetwork(net)
+				})
 				It("should return the error returned by driver.Allocate", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(Equal(rerr))
 				})
 				It("should roll back the IPAM allocations", func() {
 					// this is another case here just for documentation, it is
 					// covered by gomock
 				})
 				It("should not modify the object", func() {
+					Expect(net).To(Equal(&api.Network{ID: "net1"}))
 				})
 			})
 		})
 
 		Describe("allocating services", func() {
-			Context("successfully", func() {
+			var (
+				service *api.Service
+				err     error
+			)
+			BeforeEach(func() {
+				// add an ingress network
+				ingress := &api.Network{
+					ID: "ingress",
+					Spec: api.NetworkSpec{
+						Ingress: true,
+					},
+				}
+				initNetworks = append(initNetworks, ingress)
+
+				initService := &api.Service{
+					ID: "service1",
+					SpecVersion: &api.Version{
+						Index: 1,
+					},
+					Spec: api.ServiceSpec{
+						Endpoint: &api.EndpointSpec{
+							Mode: api.ResolutionModeVirtualIP,
+							Ports: []*api.PortConfig{
+								{
+									Name:          "foo",
+									TargetPort:    80,
+									PublishedPort: 8080,
+									Protocol:      api.ProtocolTCP,
+									PublishMode:   api.PublishModeIngress,
+								},
+							},
+						},
+						Task: api.TaskSpec{
+							Networks: []*api.NetworkAttachmentConfig{
+								&api.NetworkAttachmentConfig{
+									Target: "nw1",
+								},
+							},
+						},
+					},
+					Endpoint: &api.Endpoint{
+						Spec: &api.EndpointSpec{
+							Mode: api.ResolutionModeVirtualIP,
+							Ports: []*api.PortConfig{
+								{
+									Name:          "foo",
+									TargetPort:    80,
+									PublishedPort: 8080,
+									Protocol:      api.ProtocolTCP,
+									PublishMode:   api.PublishModeIngress,
+								},
+							},
+						},
+						Ports: []*api.PortConfig{
+							{
+								Name:          "foo",
+								TargetPort:    80,
+								PublishedPort: 8080,
+								Protocol:      api.ProtocolTCP,
+								PublishMode:   api.PublishModeIngress,
+							},
+						},
+						VirtualIPs: []*api.Endpoint_VirtualIP{
+							&api.Endpoint_VirtualIP{
+								Addr:      "192.168.3.3/24",
+								NetworkID: "nw1",
+							},
+							&api.Endpoint_VirtualIP{
+								Addr:      "192.168.4.3/24",
+								NetworkID: "ingress",
+							},
+						},
+					},
+				}
+				initServices = append(initServices, initService)
+
+				service = initService.Copy()
 			})
-			Context("when the exact same service spec version is passed", func() {
+			JustBeforeEach(func() {
+				err = a.AllocateService(service)
+			})
+			Context("when the exact same service is passed", func() {
+				It("should return ErrAlreadyAllocated", func() {
+					Expect(err).To(And(
+						HaveOccurred(),
+						WithTransform(errors.IsErrAlreadyAllocated, BeTrue()),
+					))
+				})
 			})
 			Context("when the service is already fully allocated", func() {
+				BeforeEach(func() {
+					service.SpecVersion.Index = 5
+				})
+				It("should return ErrAlreadyAllocated", func() {
+					Expect(err).To(And(
+						HaveOccurred(),
+						WithTransform(errors.IsErrAlreadyAllocated, BeTrue()),
+					))
+				})
+				It("should update the locally cached service", func() {
+					Expect(a.services).To(HaveKey(service.ID))
+					Expect(a.services[service.ID].SpecVersion.Index).To(Equal(uint64(5)))
+				})
 			})
-			Context("when the IPAM allocator returns an error", func() {
+			PContext("when the port allocator returns an error", func() {
+				BeforeEach(func() {
+
+				})
 			})
-			Context("when the IPAM allocator return ErrAlreadyAllocated", func() {
+			PContext("when the IPAM allocator returns an error", func() {
 			})
-			Context("when the service exposes ports, meaning it attaches to ingress", func() {
+			PContext("when the IPAM allocator return ErrAlreadyAllocated", func() {
+			})
+			PContext("when the service exposes ports, meaning it attaches to ingress", func() {
 			})
 		})
 	})
