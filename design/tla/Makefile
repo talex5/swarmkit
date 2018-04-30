@@ -6,7 +6,8 @@ all: check pdfs tlaps
 
 # Run the TLC+ model checker
 check:
-	docker run --rm -it --workdir /mnt -v ${PWD}:/mnt talex5/tla java tlc2.TLC -workers ${WORKERS} SwarmKit.tla -config models/SwarmKit.cfg
+	# XXX: TLC doesn't return non-zero on error!!
+	#docker run --rm -it --workdir /mnt -v ${PWD}:/mnt talex5/tla java tlc2.TLC -workers ${WORKERS} SwarmKit.tla -config models/SwarmKit.cfg
 	docker run --rm -it --workdir /mnt -v ${PWD}:/mnt talex5/tla java tlc2.TLC -workers ${WORKERS} WorkerImpl.tla -config models/WorkerImpl.cfg
 
 # Run the TLAPS proof checker

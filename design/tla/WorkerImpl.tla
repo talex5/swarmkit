@@ -35,13 +35,6 @@ ShutdownComplete ==
         /\ containers[id] = terminating
         /\ containers' = [containers EXCEPT ![id] = failed]
 
-EngineProgress ==
-  \/ ShutdownComplete
-
-Engine ==
-  \/ EngineProgress
-  \/ ContainerExit
-
 \*  Actions performed by worker nodes (actually, by the dispatcher on their behalf)
 
 (* SwarmKit thinks the node is up. i.e. the agent is connected to a manager. *)
@@ -158,12 +151,10 @@ WorkerDown ==
    Any time an agent gets an assignment set that does not include some task it has running,
    it shuts down those tasks. *)
 WorkerUp ==
-  /\ UNCHANGED << nEvents >>
+  /\ UNCHANGED << nEvents, containers, tasks >>
   /\ \E n \in Node :
        /\ ~IsUp(n)
        /\ nodes' = [nodes EXCEPT ![n] = WS!nodeUp]
-       /\ IF n = node THEN DoSync
-                      ELSE UNCHANGED << tasks, containers >>
 
 (* Tasks assigned to a node and for which the node is responsible. *)
 TasksOwnedByNode(n) == { t \in tasks :
@@ -192,6 +183,7 @@ AgentProgress ==
   \/ ProgressTask
   \/ OrphanTasks
   \/ WorkerUp
+  \/ ShutdownComplete
   \/ SyncWithManager
 
 (* All actions of the agent/worker. *)
@@ -199,6 +191,7 @@ Agent ==
   \/ AgentProgress
   \/ RejectTask
   \/ WorkerDown
+  \/ ContainerExit
 
 -------------------------------------------------------------------------------
 
@@ -212,6 +205,9 @@ CreateTask ==
             /\ t.slot \in Slot
          \/ /\ t.node \in Node
             /\ t.slot = global
+      /\ ~\E t2 \in tasks : \* All tasks of a service have the same mode
+            /\ t.service = t2.service
+            /\ (t.slot = global) # (t2.slot = global)
       /\ tasks' = tasks \union {t}
 
 UpdateTask ==
@@ -252,7 +248,7 @@ Next ==
   \/ OtherComponent
   \/ Agent
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(AgentProgress)
+Impl == Init /\ [][Next]_vars /\ WF_vars(AgentProgress)
 
 -------------------------------------------------------------------------------
 
@@ -262,8 +258,10 @@ TypeOK ==
   /\ DOMAIN containers \in SUBSET ModelTaskId
   /\ containers \in [ DOMAIN containers -> ContainerState ]
 
-(* Every action the implementation of the agent takes is a valid action in high-level the spec. *)
-Refinement ==
-  [][Agent => [WS!Agent]_<< tasks, nEvents, nodes >>]_vars
+(* We want to check that a worker implementing `Impl' is also implementing
+   `WorkerSpec'. i.e. we need to check that Impl => WSSpec. *)
+WSSpec ==
+  /\ [][WS!Agent \/ OtherComponent]_<< tasks, nEvents, nodes >>
+  /\ WF_<< tasks, nEvents, nodes >>(WS!AgentProgress)
 
 =============================================================================
