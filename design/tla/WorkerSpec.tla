@@ -58,18 +58,22 @@ RejectTask ==
        /\ IsUp(t.node)
        /\ UpdateTasks(t :> [t EXCEPT !.status.state = rejected])
 
-(* A running container finishes running on its own.
-
-   TODO: we should model the actual state of containers separately from
-   the SwarmKit manager's record of their states. *)
+(* We notify the managers that some running containers have finished.
+   There might be several updates at once (e.g. if we're reconnecting). *)
 ContainerExit ==
   /\ UNCHANGED << nodes >>
   /\ CountEvent
-  /\ \E t  \in tasks,
-        s2 \in {failed, complete} :      \* Either a successful or failed exit status
-        /\ State(t) = running
-        /\ IsUp(t.node)
-        /\ UpdateTasks(t :> [t EXCEPT !.status.state = s2])
+  /\ \E n \in Node :
+        /\ IsUp(n)
+        /\ \E ts \in SUBSET { t \in tasks : t.node = n /\ State(t) = running } :
+           \* Each container could have ended in either state:
+           \E s2 \in [ ts -> { failed, complete } ] :
+             UpdateTasks( [ t \in ts |->
+                             [t EXCEPT !.status.state =
+                               \* Report `failed' as `shutdown' if we wanted to shut down
+                               IF s2[t] = failed /\ t.desired_state = shutdown THEN shutdown
+                               ELSE s2[t]]
+                        ] )
 
 (* Tasks assigned to a node and for which the node is responsible. *)
 TasksOwnedByNode(n) == { t \in tasks :
@@ -89,10 +93,7 @@ WorkerDown ==
 (* When the node reconnects to the cluster, it gets an assignment set from the dispatcher
    which does not include any tasks that have been marked orphaned and then deleted.
    Any time an agent gets an assignment set that does not include some task it has running,
-   it shuts down those tasks.
-
-   Currently, we don't model the state of the tasks on the node separately from the SwarmKit
-   state. *)
+   it shuts down those tasks. *)
 WorkerUp ==
   /\ UNCHANGED << tasks, nEvents >>
   /\ \E n \in Node :
