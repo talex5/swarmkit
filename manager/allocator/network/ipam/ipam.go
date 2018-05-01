@@ -41,8 +41,8 @@ type Allocator interface {
 	DeallocateNetwork(*api.Network)
 	AllocateVIPs(*api.Endpoint, []string) error
 	DeallocateVIPs(*api.Endpoint)
-	AllocateAttachments([]*api.NetworkAttachmentConfig) ([]*api.NetworkAttachment, error)
-	DeallocateAttachments([]*api.NetworkAttachment)
+	AllocateAttachment(*api.NetworkAttachmentConfig) (*api.NetworkAttachment, error)
+	DeallocateAttachment(*api.NetworkAttachment) error
 }
 
 // allocator is an allocator for IP addresses and IPAM pools. It handles all
@@ -86,6 +86,8 @@ func (a *allocator) Restore(networks []*api.Network, endpoints []*api.Endpoint, 
 			pools:     make(map[string]string),
 			endpoints: make(map[string]string),
 		}
+		// TODO(dperny): is it possible for a network before this change to
+		// have an empty ipamName but be allocated?
 		ipamName := nw.IPAM.Driver.Name
 		ipamOpts := nw.IPAM.Driver.Options
 		if ipamOpts == nil {
@@ -100,7 +102,7 @@ func (a *allocator) Restore(networks []*api.Network, endpoints []*api.Endpoint, 
 		// that part of the return value
 		ipam, _ := a.drvRegistry.IPAM(ipamName)
 		if ipam == nil {
-			return errors.ErrBadState("ipam driver %v cannot be found", ipamName)
+			return errors.ErrBadState("ipam driver %q cannot be found", ipamName)
 		}
 		_, addressSpace, err := ipam.GetDefaultAddressSpaces()
 		// the only errors here result from having an invalid ipam driver
@@ -192,7 +194,9 @@ func (a *allocator) Restore(networks []*api.Network, endpoints []*api.Endpoint, 
 			// the old allocator
 			if vip != nil {
 				if err := a.restoreAddress(vip.NetworkID, vip.Addr); err != nil {
-					return err
+					// all errors returned from restoreAddress are ultimately
+					// ErrBadState, because we should always retore correctly
+					return errors.ErrBadState("error restoring vip %v: %v", vip.Addr, err)
 				}
 			}
 		}
@@ -208,7 +212,7 @@ func (a *allocator) Restore(networks []*api.Network, endpoints []*api.Endpoint, 
 				// using restoreAddress here ensures that we can't accidentally
 				// perform allocation.
 				if err := a.restoreAddress(nwid, addr); err != nil {
-					return err
+					return errors.ErrBadState("error restoring address %v: %v", addr, err)
 				}
 			}
 		}
@@ -662,131 +666,117 @@ func (a *allocator) deallocateVIPs(deallocate []*api.Endpoint_VirtualIP) {
 	}
 }
 
-// AllocateAttachments takes a list of NetworkAttachmentConfigs and allocates
-// IP addresses for all of them, returning NetworkAttachment objects.
-//
-// AllocateAttachments does not reconcile two different sets of attachments. It
-// is up to the caller to determine which attachments need to be allocated or
-// deallocated.
-func (a *allocator) AllocateAttachments(configs []*api.NetworkAttachmentConfig) (attachments []*api.NetworkAttachment, rerr error) {
-	finalAttachments := make([]*api.NetworkAttachment, 0, len(configs))
+// AllocateAttachment allocates a single network attachment belonging to a task or not.
+func (a *allocator) AllocateAttachment(config *api.NetworkAttachmentConfig) (*api.NetworkAttachment, error) {
+	// first, get the network
+	// this ONLY WORKS because a network cannot be updated. if a network can be
+	// updated, we'd have a lot more headaches.
+	local, ok := a.networks[config.Target]
+	if !ok {
+		return nil, errors.ErrDependencyNotAllocated("network", config.Target)
+	}
 
-	// if anything fails, we need to release all of the addresses we just
-	// allocated
-	defer func() {
-		if rerr != nil {
-			a.deallocateAttachments(finalAttachments)
-		}
-	}()
+	attachment := &api.NetworkAttachment{
+		Network:              local.nw,
+		Aliases:              config.Aliases,
+		DriverAttachmentOpts: config.DriverAttachmentOpts,
+		Addresses:            make([]string, 0, len(config.Addresses)),
+	}
 
-	for _, config := range configs {
-		// first, get the network
-		// this ONLY WORKS because a network cannot be updated. if a network can be
-		// updated, we'd have a lot more headaches.
-		local, ok := a.networks[config.Target]
-		if !ok {
-			return nil, errors.ErrDependencyNotAllocated("network", config.Target)
-		}
+	// now get the IPAM driver and options
+	ipam, _ := a.drvRegistry.IPAM(local.nw.IPAM.Driver.Name)
+	ipamOpts := local.nw.IPAM.Driver.Options
 
-		attachment := &api.NetworkAttachment{
-			Network:              local.nw,
-			Aliases:              config.Aliases,
-			DriverAttachmentOpts: config.DriverAttachmentOpts,
-			Addresses:            make([]string, 0, len(config.Addresses)),
-		}
-		// even before we've allocated anything, add the attachment to the
-		// finalAttachments, so that the roll back proceeds correctly if
-		// anything fails
-		finalAttachments = append(finalAttachments, attachment)
-
-		// now get the IPAM driver and options
-		ipam, _ := a.drvRegistry.IPAM(local.nw.IPAM.Driver.Name)
-		ipamOpts := local.nw.IPAM.Driver.Options
-
-		// now allocate all of the addreses. The user might not have requested
-		// any addreses specifically, in which case we should just add one
-		// emptystring for the loop body to run once
-		addresses := config.Addresses
-		if len(addresses) == 0 {
-			addresses = []string{""}
-		}
-	addressesLoop:
-		for _, address := range addresses {
-			var requestIP net.IP
-			if address != "" {
-				var err error
-				requestIP, _, err = net.ParseCIDR(address)
-				if err != nil {
-					requestIP = net.ParseIP(address)
-					if requestIP == nil {
-						return nil, errors.ErrInvalidSpec("address %v is not valid", address)
-					}
+	// now allocate all of the addreses. The user might not have requested
+	// any addreses specifically, in which case we should just add one
+	// emptystring for the loop body to run once
+	addresses := config.Addresses
+	if len(addresses) == 0 {
+		addresses = []string{""}
+	}
+addressesLoop:
+	for _, address := range addresses {
+		var requestIP net.IP
+		if address != "" {
+			var err error
+			requestIP, _, err = net.ParseCIDR(address)
+			if err != nil {
+				requestIP = net.ParseIP(address)
+				if requestIP == nil {
+					return nil, errors.ErrInvalidSpec("address %v is not valid", address)
 				}
 			}
-			// now that we've got the IP address in a usable form, try
-			// reserving it. we will need to try for each pool
-			for _, poolID := range local.pools {
-				var ip *net.IPNet
-				ip, _, err := ipam.RequestAddress(poolID, requestIP, ipamOpts)
-				if err == nil {
-					// we only want 1 address per task. so, once we've found a
-					// valid address, break out of the addresses loop, and go
-					// to the next attachmnet
-					local.endpoints[ip.String()] = poolID
-					attachment.Addresses = append(attachment.Addresses, ip.String())
-					break addressesLoop
-				}
-				// if we get ErrIPOutOfRange or ErrNoAvailableIPs, it means
-				// this pool might not be right or available for this address.
-				// in that case, try the next pool
-				if err == ipamapi.ErrIPOutOfRange || err == ipamapi.ErrNoAvailableIPs {
-					continue
-				}
-				if err == ipamapi.ErrIPAlreadyAllocated {
-					return nil, errors.ErrResourceInUse("ip", requestIP.String())
-				}
-				// if we get any other error, bail out because this address
-				// isn't going to work
-				return nil, errors.ErrInternal("error requesting address %v: %v", address, err)
+		}
+		// now that we've got the IP address in a usable form, try
+		// reserving it. we will need to try for each pool
+		for _, poolID := range local.pools {
+			var ip *net.IPNet
+			ip, _, err := ipam.RequestAddress(poolID, requestIP, ipamOpts)
+			if err == nil {
+				// we only want 1 address per task. so, once we've found a
+				// valid address, break out of the addresses loop, and go
+				// to the next attachment.
+				local.endpoints[ip.String()] = poolID
+				attachment.Addresses = append(attachment.Addresses, ip.String())
+				break addressesLoop
 			}
-			// if we get through this whole loop without exiting, it means that
-			// either the IP address is out of range of the network's pools, or
-			// there were addresses remaining
+			// if we get ErrIPOutOfRange or ErrNoAvailableIPs, it means
+			// this pool might not be right or available for this address.
+			// in that case, try the next pool
+			if err == ipamapi.ErrIPOutOfRange || err == ipamapi.ErrNoAvailableIPs {
+				continue
+			}
+			if err == ipamapi.ErrIPAlreadyAllocated {
+				return nil, errors.ErrResourceInUse("ip", requestIP.String())
+			}
+			// if we get any other error, bail out because this address
+			// isn't going to work
+			return nil, errors.ErrInternal("error requesting address %v: %v", address, err)
+		}
+		// if we get through this whole loop without exiting, it means that
+		// either the IP address is out of range of the network's pools, or
+		// there were addresses remaining
 
-			// if we didn't request any particular address, it means there were
-			// no IP addresses available and the resource is exhausted
-			if address == "" {
-				return nil, errors.ErrResourceExhausted(
-					"ip addresses",
-					"no ip addresses remain in any pool for network %v",
-					local.nw.ID,
-				)
-			}
+		// if we didn't request any particular address, it means there were
+		// no IP addresses available and the resource is exhausted
+		if address == "" {
+			return nil, errors.ErrResourceExhausted(
+				"ip addresses",
+				"no ip addresses remain in any pool for network %v",
+				local.nw.ID,
+			)
 		}
 	}
-	// finally, once we've gone through every address for every config, return
-	// the final result and no error
-	return finalAttachments, nil
+	return attachment, nil
 }
 
-func (a *allocator) DeallocateAttachments(attachments []*api.NetworkAttachment) {
-	a.deallocateAttachments(attachments)
-}
+// DeallocateAttachment deallocates a single attachment belonging to a task or
+// node
+func (a *allocator) DeallocateAttachment(attachment *api.NetworkAttachment) error {
+	// get the local network and IPAM driver
+	local := a.networks[attachment.Network.ID]
+	ipam, _ := a.drvRegistry.IPAM(local.nw.IPAM.Driver.Name)
 
-func (a *allocator) deallocateAttachments(attachments []*api.NetworkAttachment) {
-	for _, attachment := range attachments {
-		// get the local network and IPAM driver
-		local := a.networks[attachment.Network.ID]
-		ipam, _ := a.drvRegistry.IPAM(local.nw.IPAM.Driver.Name)
+	// if we get an error, we are going to continue through the function, but
+	// we will return the last error we recieve. this could mean we drop some
+	// errors, but it's very likely that this will only ever de-allocate 1
+	// address at a time, and even if there are more than 1 the error will
+	// probably be the same each time
+	var finalErr error
+	for _, address := range attachment.Addresses {
+		poolID := local.endpoints[address]
+		delete(local.endpoints, address)
 
-		for _, address := range attachment.Addresses {
-			poolID := local.endpoints[address]
-			delete(local.endpoints, address)
-
-			// both of these things can error, but we can't do anything about
-			// it if they do, so we ignore the errors.
-			ip, _, _ := net.ParseCIDR(address)
-			ipam.ReleaseAddress(poolID, ip)
+		// both of these things can error, but we can't do anything about
+		// it if they do, so we ignore the errors.
+		ip, _, _ := net.ParseCIDR(address)
+		// if we get an error
+		if err := ipam.ReleaseAddress(poolID, ip); err != nil {
+			finalErr = errors.ErrInternal(
+				"error while releasing attachment address %v: %v",
+				address, err,
+			)
 		}
 	}
+	return finalErr
 }

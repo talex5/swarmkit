@@ -25,14 +25,16 @@ func TestErrAlreadyAllocated(t *testing.T) {
 	err := ErrAlreadyAllocated()
 	require.EqualError(t, err, "object is already fully allocated")
 	require.True(t, IsErrAlreadyAllocated(err))
+	require.False(t, IsErrRetryable(err))
 }
 
 func TestErrDependencyNotAllocated(t *testing.T) {
 	t.Parallel()
 
 	err := ErrDependencyNotAllocated("network", "someid")
-	require.EqualError(t, err, "network someid depended on by object is not allocated")
+	require.EqualError(t, err, "network \"someid\" depended on by object is not allocated")
 	require.True(t, IsErrDependencyNotAllocated(err))
+	require.True(t, IsErrRetryable(err))
 }
 
 func TestErrInvalidSpec(t *testing.T) {
@@ -42,12 +44,13 @@ func TestErrInvalidSpec(t *testing.T) {
 	err := ErrInvalidSpec("something is %q", "wrong")
 	require.EqualError(t, err, "spec is invalid: something is \"wrong\"")
 	require.True(t, IsErrInvalidSpec(err))
+	require.False(t, IsErrRetryable(err))
 
 	// without string formatting
 	err2 := ErrInvalidSpec("foo")
 	require.EqualError(t, err2, "spec is invalid: foo")
 	require.True(t, IsErrInvalidSpec(err2))
-
+	require.False(t, IsErrRetryable(err))
 }
 
 func TestErrInternal(t *testing.T) {
@@ -57,11 +60,13 @@ func TestErrInternal(t *testing.T) {
 	err := ErrInternal("something is %v %v", "wrong", 1234)
 	require.EqualError(t, err, "internal allocator error: something is wrong 1234")
 	require.True(t, IsErrInternal(err))
+	require.True(t, IsErrRetryable(err))
 
 	// without string formatting
 	err2 := ErrInternal("foo")
 	require.EqualError(t, err2, "internal allocator error: foo")
 	require.True(t, IsErrInternal(err2))
+	require.True(t, IsErrRetryable(err))
 }
 
 func TestErrResourceExhausted(t *testing.T) {
@@ -71,11 +76,13 @@ func TestErrResourceExhausted(t *testing.T) {
 	err := ErrResourceExhausted("ip address", "pool %v is %v", 12345, "full")
 	require.EqualError(t, err, "resource ip address is exhausted: pool 12345 is full")
 	require.True(t, IsErrResourceExhausted(err))
+	require.True(t, IsErrRetryable(err))
 
 	// without string formatting
 	err2 := ErrResourceExhausted("port", "nothing remains")
 	require.EqualError(t, err2, "resource port is exhausted: nothing remains")
 	require.True(t, IsErrResourceExhausted(err2))
+	require.True(t, IsErrRetryable(err))
 }
 
 func TestErrResourceInUse(t *testing.T) {
@@ -84,6 +91,7 @@ func TestErrResourceInUse(t *testing.T) {
 	err := ErrResourceInUse("ip address", "192.168.187.1")
 	require.EqualError(t, err, "ip address 192.168.187.1 is in use")
 	require.True(t, IsErrResourceInUse(err))
+	require.True(t, IsErrRetryable(err))
 }
 
 func TestErrBadState(t *testing.T) {
@@ -93,9 +101,11 @@ func TestErrBadState(t *testing.T) {
 	err := ErrBadState("something wrong %v %v", "in the", "allocator")
 	require.EqualError(t, err, "an invalid state was encountered: something wrong in the allocator")
 	require.True(t, IsErrBadState(err))
+	require.False(t, IsErrRetryable(err))
 
 	// without string formatting
 	err2 := ErrBadState("totally busted")
 	require.EqualError(t, err2, "an invalid state was encountered: totally busted")
 	require.True(t, IsErrBadState(err2))
+	require.False(t, IsErrRetryable(err))
 }

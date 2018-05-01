@@ -39,7 +39,7 @@ func ErrDependencyNotAllocated(objectType string, id string) error {
 
 // Error returns the error message
 func (e errDependencyNotAllocated) Error() string {
-	return fmt.Sprintf("%v %v depended on by object is not allocated", e.objectType, e.id)
+	return fmt.Sprintf("%v %q depended on by object is not allocated", e.objectType, e.id)
 }
 
 // IsErrDependencyNotAllocated returns true if this error is a result of a
@@ -184,4 +184,15 @@ func (e errBadState) Error() string {
 func IsErrBadState(e error) bool {
 	_, ok := e.(errBadState)
 	return ok
+}
+
+// IsErrRetryable returns true if the error is one that may be transient and
+// should be retried later
+func IsErrRetryable(e error) bool {
+	switch e.(type) {
+	case errDependencyNotAllocated, errInternal, errResourceExhausted, errResourceInUse:
+		return true
+	default:
+		return false
+	}
 }

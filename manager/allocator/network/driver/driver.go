@@ -206,7 +206,7 @@ func (a *allocator) getDriver(name string) (driverapi.Driver, *driverapi.Capabil
 		pg := a.drvRegistry.GetPluginGetter()
 		if pg == nil {
 			// This case should never happen
-			return nil, nil, errors.ErrInternal("plugingetter is not initialized")
+			return nil, nil, errors.ErrInternal("plugin store is not initialized")
 		}
 		_, err := pg.Get(name, driverapi.NetworkPluginEndpointType, plugingetter.Lookup)
 		if err != nil {

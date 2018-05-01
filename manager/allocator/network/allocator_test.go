@@ -79,7 +79,13 @@ var _ = Describe("network.Allocator", func() {
 					{
 						ID: "fooNet",
 					},
+					{
+						ID: "localnet",
+					},
 				}
+				// fooNet will be global, but localnet will be local
+				mockDriver.EXPECT().IsNetworkNodeLocal(initNetworks[0]).Return(false, nil)
+				mockDriver.EXPECT().IsNetworkNodeLocal(initNetworks[1]).Return(true, nil)
 				mockPort.EXPECT().Restore([]*api.Endpoint{})
 				mockIpam.EXPECT().Restore(initNetworks, []*api.Endpoint{}, []*api.NetworkAttachment{}).Return(nil)
 				mockDriver.EXPECT().Restore(initNetworks).Return(nil)
@@ -92,6 +98,10 @@ var _ = Describe("network.Allocator", func() {
 				// which will fail if it doesn't call restore with the
 				// networks. this spec has been left here for documentation
 				// purposes
+			})
+			It("should keep track of node-local networks", func() {
+				Expect(a.nodeLocalNetworks).To(HaveKey("localnet"))
+				Expect(a.nodeLocalNetworks["localnet"]).To(Equal(initNetworks[1]))
 			})
 		})
 		Context("when there are some services allocated", func() {
@@ -176,21 +186,34 @@ var _ = Describe("network.Allocator", func() {
 					{},
 					{
 						Networks: []*api.NetworkAttachment{
-							{Network: &api.Network{}, Addresses: []string{"192.168.1.4/24"}},
-							{Network: &api.Network{}, Addresses: []string{"192.168.2.4/24"}},
+							{Network: &api.Network{ID: "foo"}, Addresses: []string{"192.168.1.4/24"}},
+							{Network: &api.Network{ID: "bar"}, Addresses: []string{"192.168.2.4/24"}},
 						},
 					},
 					{
 						Networks: []*api.NetworkAttachment{
-							{Network: &api.Network{}, Addresses: []string{"192.168.3.4/24"}},
-							{Network: &api.Network{}, Addresses: []string{"192.168.4.4/24"}},
+							{Network: &api.Network{ID: "baz"}, Addresses: []string{"192.168.3.4/24"}},
+							{Network: &api.Network{ID: "bat"}, Addresses: []string{"192.168.4.4/24"}},
+						},
+					},
+					{
+						Networks: []*api.NetworkAttachment{
+							{Network: &api.Network{ID: "local"}, Addresses: []string{"10.6.6.6"}},
 						},
 					},
 				}
+
+				// add the "local" network, which will be node-local
+				local := &api.Network{
+					ID: "local",
+				}
+				initNetworks = append(initNetworks, local)
+				mockDriver.EXPECT().IsNetworkNodeLocal(local).Return(true, nil)
+
 				attachments := append(initTasks[1].Copy().Networks, initTasks[2].Copy().Networks...)
 				mockPort.EXPECT().Restore([]*api.Endpoint{})
-				mockIpam.EXPECT().Restore(nil, []*api.Endpoint{}, attachments).Return(nil)
-				mockDriver.EXPECT().Restore(nil).Return(nil)
+				mockIpam.EXPECT().Restore(initNetworks, []*api.Endpoint{}, attachments).Return(nil)
+				mockDriver.EXPECT().Restore(initNetworks).Return(nil)
 			})
 			It("should not return an error", func() {
 				Expect(err).ToNot(HaveOccurred())
@@ -318,6 +341,16 @@ var _ = Describe("network.Allocator", func() {
 		})
 
 		JustBeforeEach(func() {
+			// just before, we should prepare for a bunch of calls to
+			// IsNetworkNodeLocal
+			for _, nw := range initNetworks {
+				// use the driver name "local" to indicate node-local networks
+				if nw.DriverState != nil && nw.DriverState.Name == "local" {
+					mockDriver.EXPECT().IsNetworkNodeLocal(nw).Return(true, nil)
+				} else {
+					mockDriver.EXPECT().IsNetworkNodeLocal(nw).Return(false, nil)
+				}
+			}
 			// Before we start, do a restore of all of these pre-populated
 			// items.
 
@@ -425,7 +458,13 @@ var _ = Describe("network.Allocator", func() {
 						Ingress: true,
 					},
 				}
-				initNetworks = append(initNetworks, ingress)
+				local := &api.Network{
+					ID: "localnet",
+					DriverState: &api.Driver{
+						Name: "local",
+					},
+				}
+				initNetworks = append(initNetworks, ingress, local)
 
 				initService := &api.Service{
 					ID: "service1",
@@ -517,6 +556,20 @@ var _ = Describe("network.Allocator", func() {
 					Expect(a.services[service.ID].SpecVersion.Index).To(Equal(uint64(5)))
 				})
 			})
+			Context("when the service's tasks have node-local network attachments", func() {
+				BeforeEach(func() {
+					service.Spec.Task.Networks = append(
+						service.Spec.Task.Networks,
+						&api.NetworkAttachmentConfig{
+							Target: "localnet",
+						},
+					)
+				})
+				It("should not allocate a VIP for the node-local network", func() {
+					Expect(a.nodeLocalNetworks).To(HaveKey("localnet"))
+					// covered by gomock
+				})
+			})
 			PContext("when the port allocator returns an error", func() {
 				BeforeEach(func() {
 
@@ -528,6 +581,15 @@ var _ = Describe("network.Allocator", func() {
 			})
 			PContext("when the service exposes ports, meaning it attaches to ingress", func() {
 			})
+		})
+
+		PDescribe("allocating tasks", func() {
+			BeforeEach(func() {
+
+			})
+		})
+
+		PDescribe("allocating nodes", func() {
 		})
 	})
 
@@ -628,6 +690,14 @@ var _ = Describe("network.Allocator", func() {
 			})
 			It("should return false", func() {
 				Expect(result).To(BeFalse())
+			})
+		})
+		Context("when the service is totally empty", func() {
+			BeforeEach(func() {
+				service = &api.Service{ID: "foo"}
+			})
+			It("should return true", func() {
+				Expect(result).To(BeTrue())
 			})
 		})
 	})

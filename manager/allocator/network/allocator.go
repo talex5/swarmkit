@@ -41,9 +41,15 @@ type allocator struct {
 	// us to avoid having to pass an endpoint from the service when allocating
 	// a task.
 	services map[string]*api.Service
-	// note that we don't need to keep track of networks; the lower-level
-	// components handle networks directly and keep track of them as needed,
-	// unlike services, which exist strictly at this level and above.
+
+	// some networks are node-local, meaning we do not perform driver or IP
+	// address allocation on them. however, we still need to know what they are
+	// so that the allocator can handle attachments to these node-local
+	// networks correctly. this map keeps a set of all such node-local
+	// networks, so we know when allocating attachments to skip over these.
+	// This is roughly analogous to the networks map in the IPAM allocator but
+	// with a different set of networks
+	nodeLocalNetworks map[string]*api.Network
 
 	// also attachments don't need to be kept track of, because nothing depends
 	// on them.
@@ -63,10 +69,11 @@ type allocator struct {
 // environments
 func newAllocatorWithComponents(ipamAlloc ipam.Allocator, driverAlloc driver.Allocator, portAlloc port.Allocator) *allocator {
 	return &allocator{
-		services: map[string]*api.Service{},
-		ipam:     ipamAlloc,
-		driver:   driverAlloc,
-		port:     portAlloc,
+		services:          map[string]*api.Service{},
+		nodeLocalNetworks: map[string]*api.Network{},
+		ipam:              ipamAlloc,
+		driver:            driverAlloc,
+		port:              portAlloc,
 	}
 }
 
@@ -96,10 +103,11 @@ func NewAllocator(pg plugingetter.PluginGetter) Allocator {
 		panic(fmt.Sprintf("initIPAMDrivers returned an error: %v", err))
 	}
 	return &allocator{
-		services: map[string]*api.Service{},
-		port:     port.NewAllocator(),
-		ipam:     ipam.NewAllocator(reg),
-		driver:   driver.NewAllocator(reg),
+		services:          map[string]*api.Service{},
+		nodeLocalNetworks: map[string]*api.Network{},
+		port:              port.NewAllocator(),
+		ipam:              ipam.NewAllocator(reg),
+		driver:            driver.NewAllocator(reg),
 	}
 }
 
@@ -125,6 +133,15 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 		if ok && nw.Spec.Annotations.Name == "ingress" {
 			a.ingressID = nw.ID
 		}
+		local, err := a.driver.IsNetworkNodeLocal(nw)
+		if err != nil {
+			return err
+		}
+
+		// check if the network is node-local, and add it to our set if so.
+		if local {
+			a.nodeLocalNetworks[nw.ID] = nw
+		}
 	}
 
 	endpoints := make([]*api.Endpoint, 0, len(services))
@@ -145,10 +162,15 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 	// get all of the attachments out of tasks
 	for _, task := range tasks {
 		for _, attachment := range task.Networks {
-			attachments = append(attachments, attachment)
+			// if an attachment belongs to a node-local network, do not restore
+			// it
+			if _, ok := a.nodeLocalNetworks[attachment.Network.ID]; !ok {
+				attachments = append(attachments, attachment)
+			}
 		}
 	}
 	for _, node := range nodes {
+		// there will be no node-local networks in a node's attachments
 		for _, attachment := range node.Attachments {
 			attachments = append(attachments, attachment)
 		}
@@ -159,6 +181,10 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 	a.port.Restore(endpoints)
 	// errors from deeper components are always structured and can be returned
 	// directly.
+
+	// it is safe to call ipam.Restore on all networks including node-local
+	// networks, because those networks have no ipam state and nothing to
+	// restore
 	if err := a.ipam.Restore(networks, endpoints, attachments); err != nil {
 		return err
 	}
@@ -270,7 +296,11 @@ func (a *allocator) AllocateService(service *api.Service) error {
 	ids := make([]string, 0, len(networks))
 	// build up a list of network ids to allocate vips for
 	for _, nw := range networks {
-		ids = append(ids, nw.Target)
+		// we don't allocate VIPs for node-local networks, so if the network is
+		// found in the nodeLocalNetworks set, skip it
+		if _, ok := a.nodeLocalNetworks[nw.Target]; !ok {
+			ids = append(ids, nw.Target)
+		}
 	}
 
 	// ingress is special because it cannot be normally attached to and so will
@@ -325,7 +355,7 @@ func (a *allocator) DeallocateService(service *api.Service) error {
 // If the return value if nil, then the task has been fully allocated.
 // Otherwise, the task has not been allocated at all. This method will never
 // leave the task in a partially allocated state.
-func (a *allocator) AllocateTask(task *api.Task) error {
+func (a *allocator) AllocateTask(task *api.Task) (rerr error) {
 	// if the task state is past new, then it's already allocated
 	if task.Status.State > api.TaskStateNew {
 		return errors.ErrAlreadyAllocated()
@@ -346,7 +376,7 @@ func (a *allocator) AllocateTask(task *api.Task) error {
 	// required, there needs to be a NetworkAttachment on the object for the
 	// ingress network.
 	attachmentConfigs := task.Spec.Networks
-	if ingressNeeded(task.Endpoint.Ports) {
+	if task.Endpoint != nil && ingressNeeded(task.Endpoint.Ports) {
 		// NOTE(dperny): if i recall correctly, append should not modify the
 		// original slice here, which means this is safe to do without
 		// accidentally modifying the spec.
@@ -356,14 +386,41 @@ func (a *allocator) AllocateTask(task *api.Task) error {
 			&api.NetworkAttachmentConfig{Target: a.ingressID},
 		)
 	}
-	// typically, we would have to pass both the configs and the actual objects
-	// in order to reconile the differences. however, tasks are a 1-way street;
-	// once they're allocated, they're done.
-	attachments, err := a.ipam.AllocateAttachments(attachmentConfigs)
-	if err != nil {
-		return err
+	// set up a slice to contain all of the attachments we will create
+	finalAttachments := make([]*api.NetworkAttachment, 0, len(attachmentConfigs))
+	// and set up a defer to roll back attachments. We may have some
+	// attachments succeed before one fails. If one does fail, we should
+	// deallocate all of the ones that succeeded
+	defer func() {
+		if rerr != nil {
+			a.DeallocateTask(task)
+		}
+	}()
+
+	// now go through and allocate all of the attachment
+	for _, config := range attachmentConfigs {
+		var attachment *api.NetworkAttachment
+		// check if the network is node-local. If so, then we do not pass
+		// through the IPAM allocator; we just create the attachment here,
+		// passing through all of the relevant configuration
+		if nw, ok := a.nodeLocalNetworks[config.Target]; ok {
+			attachment = &api.NetworkAttachment{
+				Network:              nw,
+				Aliases:              config.Aliases,
+				Addresses:            config.Addresses,
+				DriverAttachmentOpts: config.DriverAttachmentOpts,
+			}
+		} else {
+			var err error
+			attachment, err = a.ipam.AllocateAttachment(config)
+			if err != nil {
+				return err
+			}
+		}
+		finalAttachments = append(finalAttachments, attachment)
 	}
-	task.Networks = attachments
+
+	task.Networks = finalAttachments
 	return nil
 }
 
@@ -374,12 +431,25 @@ func (a *allocator) AllocateTask(task *api.Task) error {
 // If this method returns nil, the result of the task allocation should be
 // committed, if it is not being deleted.
 func (a *allocator) DeallocateTask(task *api.Task) error {
-	a.ipam.DeallocateAttachments(task.Networks)
+	// keep track of the last error we recieve to return to the caller. even if
+	// we get an error, we're going to keep going, because there is likely no
+	// sane or easy way to handle error conditions. by only taking the last
+	// error, we may drop some earlier errors, but it is more than likely that
+	// if we get more than one error on deallocate, they will have the same
+	// root cause
+	var finalErr error
 	for _, attachment := range task.Networks {
-		// remove the addresses after we've deallocated every attachment
-		attachment.Addresses = nil
+		// if the network is node-local, it was not allocated through IPAM, and
+		// we should skip it.
+		if _, ok := a.nodeLocalNetworks[attachment.Network.ID]; !ok {
+			if err := a.ipam.DeallocateAttachment(attachment); err != nil {
+				finalErr = err
+			}
+			// remove the addresses after we've deallocated every attachment
+			attachment.Addresses = nil
+		}
 	}
-	return nil
+	return finalErr
 }
 
 // AllocateNode allocates the network attachments for a node. The second
@@ -393,7 +463,12 @@ func (a *allocator) DeallocateTask(task *api.Task) error {
 //
 // If this method returns nil, then the node has been fully allocated, and
 // should be committed. Otherwise, the node will not be altered.
-func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) error {
+func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) (rerr error) {
+	// allow the caller to pass a nil map, but make sure that it's not nil when
+	// we want to use it.
+	if networks == nil {
+		networks = map[string]struct{}{}
+	}
 	// before we do anything, add the ingress network if it exists to the
 	// networks map. we always need an ingress network attachment.
 	if a.ingressID != "" {
@@ -437,16 +512,34 @@ func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) e
 		})
 	}
 
-	// finally, try allocating the attachments. if it fails return an error. If
-	// it succeeds, then free the attachments we no longer need, and set the
-	// node attachments list
-	attachments, err := a.ipam.AllocateAttachments(allocate)
-	if err != nil {
-		return err
+	finalAttachments := make([]*api.NetworkAttachment, 0, len(allocate))
+	defer func() {
+		if rerr != nil {
+			for _, attachment := range finalAttachments {
+				a.ipam.DeallocateAttachment(attachment)
+			}
+		}
+	}()
+
+	for _, config := range allocate {
+		// we don't need to check if networks are node-local, because the
+		// caller is only going to pass in overlay networks. If they pass in
+		// something else, it will fail in the AllocateAttachment function
+		// because the network will not be allocated.
+		attachment, err := a.ipam.AllocateAttachment(config)
+		if err != nil {
+			return err
+		}
+		finalAttachments = append(finalAttachments, attachment)
 	}
 
-	a.ipam.DeallocateAttachments(remove)
-	node.Attachments = append(keep, attachments...)
+	// do NOT return an error if deallocate fails. allocation succeeded, we're
+	// fine. we can't safely roll back a deallocation anyway
+	for _, attachment := range remove {
+		a.ipam.DeallocateAttachment(attachment)
+	}
+
+	node.Attachments = append(keep, finalAttachments...)
 	return nil
 }
 
@@ -456,11 +549,14 @@ func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) e
 // If this method returns no error, and the node is not being deleted, then the
 // node should be committed.
 func (a *allocator) DeallocateNode(node *api.Node) error {
-	a.ipam.DeallocateAttachments(node.Attachments)
+	var finalErr error
 	for _, attachment := range node.Attachments {
+		if err := a.ipam.DeallocateAttachment(attachment); err != nil {
+			finalErr = err
+		}
 		attachment.Addresses = nil
 	}
-	return nil
+	return finalErr
 }
 
 // isServiceFullyAllocated takes a service and returns true if its endpoint
@@ -473,66 +569,78 @@ func (a *allocator) isServiceFullyAllocated(service *api.Service) bool {
 	// isn't fully allocated, we still need to pass it to the Restore
 	// methods, because we absolutely must have the entire state, fully
 	// allocated or not, before we can pursue new allocations.
-	if service.Spec.Endpoint != nil && service.Endpoint.Spec != nil {
-		// if the mode differs, the service isn't fully allocated
-		if service.Endpoint.Spec.Mode != service.Spec.Endpoint.Mode {
+
+	// create a guaranteed non-nil endpoint so we can proceed correctly
+	endpoint := &api.Endpoint{Spec: &api.EndpointSpec{}}
+	// if the service has a nil endpoint and a non-nil spec, we're not allocated
+	if service.Endpoint != nil {
+		endpoint = service.Endpoint
+		if endpoint.Spec == nil {
+			endpoint.Spec = &api.EndpointSpec{}
+		}
+	}
+	spec := &api.EndpointSpec{}
+	if service.Spec.Endpoint != nil {
+		spec = service.Spec.Endpoint
+	}
+	// if the mode differs, the service isn't fully allocated
+	if endpoint.Spec.Mode != spec.Mode {
+		return false
+	}
+	// if we're using vips, check that we're using the right vips
+	if spec.Mode == api.ResolutionModeVirtualIP {
+		// how many networks should we have? the same number as our spec's
+		// attachments, plus ingress if we need it. ingress cannot be
+		// attached to normally, so will not be in the spec's network
+		// attachments, but if it is needed it should be in the service's
+		// VIPs.
+		expectedNetworks := len(service.Spec.Task.Networks)
+		ingress := ingressNeeded(spec.Ports)
+		if ingress {
+			expectedNetworks = expectedNetworks + 1
+		}
+		// if there are differing numbers of VIPs and attachments, we have
+		// some allocation or deallocation to do
+		if len(endpoint.VirtualIPs) != expectedNetworks {
 			return false
 		}
-		// if we're using vips, check that we're using the right vips
-		if service.Spec.Endpoint.Mode == api.ResolutionModeVirtualIP {
-			// how many networks should we have? the same number as our spec's
-			// attachments, plus ingress if we need it. ingress cannot be
-			// attached to normally, so will not be in the spec's network
-			// attachments, but if it is needed it should be in the service's
-			// VIPs.
-			expectedNetworks := len(service.Spec.Task.Networks)
-			ingress := ingressNeeded(service.Spec.Endpoint.Ports)
-			if ingress {
-				expectedNetworks = expectedNetworks + 1
+		// i'm not totally happy with this part because I think it slightly
+		// breaks the separation of concerns, but i think it's more
+		// important to guard the ipam package from the details of services
+		// and tasks than to guard the network allocator package from the
+		// details of IP addresses.
+	vipsLoop:
+		for _, vip := range endpoint.VirtualIPs {
+			// first, if we need ingress, check if this VIP is for ingress.
+			// if it is, then it won't be in the spec's networks, but it is
+			// supposed to be there, so we can skip looking for it. If
+			// ingress ISN'T needed but we find it in the VIPs, then it
+			// will fall through this case, pass through the spec's
+			// networks loop without continuing, and then return false
+			// because it's not supposed to be there.
+			if ingress && vip.NetworkID == a.ingressID {
+				continue vipsLoop
 			}
-			// if there are differing numbers of VIPs and attachments, we have
-			// some allocation or deallocation to do
-			if len(service.Endpoint.VirtualIPs) != expectedNetworks {
-				return false
-			}
-			// i'm not totally happy with this part because I think it slightly
-			// breaks the separation of concerns, but i think it's more
-			// important to guard the ipam package from the details of services
-			// and tasks than to guard the network allocator package from the
-			// details of IP addresses.
-		vipsLoop:
-			for _, vip := range service.Endpoint.VirtualIPs {
-				// first, if we need ingress, check if this VIP is for ingress.
-				// if it is, then it won't be in the spec's networks, but it is
-				// supposed to be there, so we can skip looking for it. If
-				// ingress ISN'T needed but we find it in the VIPs, then it
-				// will fall through this case, pass through the spec's
-				// networks loop without continuing, and then return false
-				// because it's not supposed to be there.
-				if ingress && vip.NetworkID == a.ingressID {
+			// NOTE(dperny): this does _not_ cover the deprecated
+			// service.Spec.Networks field.
+			for _, nw := range service.Spec.Task.Networks {
+				if nw != nil && nw.Target == vip.NetworkID {
+					// if we find a target that matches this vip, then
+					// we can go to the next VIP and check it
 					continue vipsLoop
 				}
-				// NOTE(dperny): this does _not_ cover the deprecated
-				// service.Spec.Networks field.
-				for _, nw := range service.Spec.Task.Networks {
-					if nw != nil && nw.Target == vip.NetworkID {
-						// if we find a target that matches this vip, then
-						// we can go to the next VIP and check it
-						continue vipsLoop
-					}
-				}
-				// if we get all the way through the networks and there is
-				// nothing matching this VIP, the service isn't fully
-				// allocated
-				return false
 			}
-		}
-		// if we got this far, and the ports are also already allocated,
-		// then the service is fully allocated and we can track it in our
-		// map.
-		if !port.AlreadyAllocated(service.Endpoint, service.Spec.Endpoint) {
+			// if we get all the way through the networks and there is
+			// nothing matching this VIP, the service isn't fully
+			// allocated
 			return false
 		}
+	}
+	// if we got this far, and the ports are also already allocated,
+	// then the service is fully allocated and we can track it in our
+	// map.
+	if !port.AlreadyAllocated(endpoint, spec) {
+		return false
 	}
 	return true
 }

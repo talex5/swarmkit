@@ -126,25 +126,27 @@ func (mr *MockAllocatorMockRecorder) DeallocateVIPs(arg0 interface{}) *gomock.Ca
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeallocateVIPs", reflect.TypeOf((*MockAllocator)(nil).DeallocateVIPs), arg0)
 }
 
-// AllocateAttachments mocks base method
-func (m *MockAllocator) AllocateAttachments(arg0 []*api.NetworkAttachmentConfig) ([]*api.NetworkAttachment, error) {
-	ret := m.ctrl.Call(m, "AllocateAttachments", arg0)
-	ret0, _ := ret[0].([]*api.NetworkAttachment)
+// AllocateAttachment mocks base method
+func (m *MockAllocator) AllocateAttachment(arg0 *api.NetworkAttachmentConfig) (*api.NetworkAttachment, error) {
+	ret := m.ctrl.Call(m, "AllocateAttachment", arg0)
+	ret0, _ := ret[0].(*api.NetworkAttachment)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// AllocateAttachments indicates an expected call of AllocateAttachments
-func (mr *MockAllocatorMockRecorder) AllocateAttachments(arg0 interface{}) *gomock.Call {
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AllocateAttachments", reflect.TypeOf((*MockAllocator)(nil).AllocateAttachments), arg0)
+// AllocateAttachment indicates an expected call of AllocateAttachment
+func (mr *MockAllocatorMockRecorder) AllocateAttachment(arg0 interface{}) *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AllocateAttachment", reflect.TypeOf((*MockAllocator)(nil).AllocateAttachment), arg0)
 }
 
-// DeallocateAttachments mocks base method
-func (m *MockAllocator) DeallocateAttachments(arg0 []*api.NetworkAttachment) {
-	m.ctrl.Call(m, "DeallocateAttachments", arg0)
+// DeallocateAttachment mocks base method
+func (m *MockAllocator) DeallocateAttachment(arg0 *api.NetworkAttachment) error {
+	ret := m.ctrl.Call(m, "DeallocateAttachment", arg0)
+	ret0, _ := ret[0].(error)
+	return ret0
 }
 
-// DeallocateAttachments indicates an expected call of DeallocateAttachments
-func (mr *MockAllocatorMockRecorder) DeallocateAttachments(arg0 interface{}) *gomock.Call {
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeallocateAttachments", reflect.TypeOf((*MockAllocator)(nil).DeallocateAttachments), arg0)
+// DeallocateAttachment indicates an expected call of DeallocateAttachment
+func (mr *MockAllocatorMockRecorder) DeallocateAttachment(arg0 interface{}) *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeallocateAttachment", reflect.TypeOf((*MockAllocator)(nil).DeallocateAttachment), arg0)
 }

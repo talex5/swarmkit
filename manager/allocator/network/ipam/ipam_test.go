@@ -1233,41 +1233,25 @@ var _ = Describe("ipam.Allocator", func() {
 		// please no more
 		Describe("allocating attachments", func() {
 			var (
-				specs       []*api.NetworkAttachmentConfig
-				attachments []*api.NetworkAttachment
-				err         error
+				spec       *api.NetworkAttachmentConfig
+				attachment *api.NetworkAttachment
+				err        error
 			)
-			BeforeEach(func() {
-				specs = []*api.NetworkAttachmentConfig{
-					{
-						Target:               "nw1",
-						DriverAttachmentOpts: map[string]string{"foo": "true"},
-					},
-					{
-						Target:    "nw2",
-						Addresses: []string{"192.168.2.3", "192.168.2.4"},
-					},
-				}
-			})
 			JustBeforeEach(func() {
-				attachments, err = a.AllocateAttachments(specs)
+				attachment, err = a.AllocateAttachment(spec)
 			})
-			Context("when successfully allocating attachments", func() {
-				It("should not return an error", func() {
-					Expect(err).ToNot(HaveOccurred())
-				})
-				It("should return the same number of attachments requested", func() {
-					Expect(attachments).To(HaveLen(len(specs)))
-					for _, attachment := range attachments {
-						Expect(attachment).ToNot(BeNil())
+			Context("when an attachment has no addresses specified", func() {
+				BeforeEach(func() {
+					spec = &api.NetworkAttachmentConfig{
+						Target:               "nw1",
+						DriverAttachmentOpts: map[string]string{"foo": "bar"},
 					}
 				})
-				It("should allocate new addresses for attachments with no addresses specified", func() {
-					// once again, we're relying on the order of attachments,
-					// which is only for convenience. If we change the
-					// implementation later, and this test fails, it's no big
-					// deal.
-					addresses := attachments[0].Addresses
+				It("should not error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should allocate new addresses", func() {
+					addresses := attachment.Addresses
 					Expect(addresses).ToNot(BeEmpty())
 					Expect(addresses).To(HaveLen(1))
 					Expect(addresses[0]).To(Equal("192.168.3.0/24"))
@@ -1276,39 +1260,21 @@ var _ = Describe("ipam.Allocator", func() {
 					// NOTE(dperny): there are no guarantees made about
 					// the attachments being returned in order. we're relying
 					// on that behavior here for convenience's sake.
-					for i := range attachments {
-						Expect(specs[i].DriverAttachmentOpts).To(Equal(attachments[i].DriverAttachmentOpts))
+					Expect(spec.DriverAttachmentOpts).To(Equal(attachment.DriverAttachmentOpts))
+				})
+			})
+			Context("when an attachment has addresses specified", func() {
+				BeforeEach(func() {
+					spec = &api.NetworkAttachmentConfig{
+						Target:    "nw2",
+						Addresses: []string{"192.168.2.3", "192.168.2.4"},
 					}
 				})
 				It("should only allocate the first address available if a list of addresses is provided", func() {
-					addresses := attachments[1].Addresses
+					addresses := attachment.Addresses
 					Expect(addresses).ToNot(BeEmpty())
 					Expect(addresses).To(HaveLen(1))
 					Expect(addresses[0]).To(Equal("192.168.2.3/24"))
-				})
-			})
-			Context("when some addresses have already been allocated and then allocation fails", func() {
-				BeforeEach(func() {
-					// mockIpam without fields just returns errors, which
-					// is what we want.
-					reg.ipams[swappableIPAM] = ipamAndCaps{&mockIpam{
-						requestAddressFunc: func(_ string, _ net.IP, _ map[string]string) (*net.IPNet, map[string]string, error) {
-							return nil, nil, fmt.Errorf("failed!")
-						},
-					}, nil}
-				})
-				AfterEach(func() {
-					reg.ipams[swappableIPAM] = reg.ipams[ipamapi.DefaultIPAM]
-				})
-				It("should release the allocated addresses", func() {
-					Expect(addressesReleased).To(HaveLen(1))
-					Expect(addressesReleased).To(HaveKey("192.168.3.0"))
-					poolID := pool["192.168.3.0"]
-					Expect(addressesReleased["192.168.3.0"]).To(Equal(poolID))
-				})
-				It("should return an error", func() {
-					Expect(err).To(HaveOccurred())
-					Expect(err).To(WithTransform(errors.IsErrInternal, BeTrue()))
 				})
 			})
 		})
