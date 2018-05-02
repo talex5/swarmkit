@@ -161,9 +161,14 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 	attachments := []*api.NetworkAttachment{}
 	// get all of the attachments out of tasks
 	for _, task := range tasks {
+		// skip all tasks that are in terminal states. their resources are no
+		// longer in use
+		if task.Status.State >= api.TaskStateCompleted {
+			continue
+		}
 		for _, attachment := range task.Networks {
-			// if an attachment belongs to a node-local network, do not restore
-			// it
+			// only restore attachments that do not belong to node-local
+			// networks
 			if _, ok := a.nodeLocalNetworks[attachment.Network.ID]; !ok {
 				attachments = append(attachments, attachment)
 			}
@@ -334,7 +339,10 @@ func (a *allocator) AllocateService(service *api.Service) error {
 // DeallocateService takes a service and frees its network resources.
 func (a *allocator) DeallocateService(service *api.Service) error {
 	if service.Endpoint != nil {
-		a.port.Deallocate(service.Endpoint)
+		// we can just straight away commit the proposal, no need to wait when
+		// deallocating
+		prop := a.port.Deallocate(service.Endpoint)
+		prop.Commit()
 		a.ipam.DeallocateVIPs(service.Endpoint)
 	}
 	delete(a.services, service.ID)
