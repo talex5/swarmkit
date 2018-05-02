@@ -10,5 +10,5 @@ mistakes. Use `make check` to run the checks.
 If you want to edit these specifications, you will probably want to use the [TLA+ Toolbox][],
 which provides a GUI.
 
-[TLA+]: https://en.wikipedia.org/wiki/TLA%2B)
+[TLA+]: https://en.wikipedia.org/wiki/TLA%2B
 [TLA+ Toolbox]: http://lamport.azurewebsites.net/tla/toolbox.html

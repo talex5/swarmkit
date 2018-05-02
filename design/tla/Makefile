@@ -6,7 +6,7 @@ TLA := docker run --rm -it --workdir /mnt -v ${PWD}:/mnt talex5/tla
 
 all: check pdfs tlaps
 
-# Run the TLC+ model checker
+# Run the TLC model checker
 check:
 	${TLA} tlc -workers ${WORKERS} SwarmKit.tla -config models/SwarmKit.cfg
 	${TLA} tlc -workers ${WORKERS} WorkerImpl.tla -config models/WorkerImpl.cfg
