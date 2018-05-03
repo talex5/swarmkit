@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/pkg/plugingetter"
+	metrics "github.com/docker/go-metrics"
 
 	"github.com/docker/swarmkit/manager/allocator/network"
 	"github.com/docker/swarmkit/manager/allocator/network/errors"
@@ -22,9 +23,48 @@ const (
 	maxBatchInterval = 500 * time.Millisecond
 )
 
+var (
+	batchProcessingDuration metrics.Timer
+
+	storeLockHeld    metrics.LabeledTimer
+	allocatorActions metrics.LabeledTimer
+)
+
+func init() {
+	ns := metrics.NewNamespace("swarmkit", "allocator")
+
+	allocatorActions = ns.NewLabeledTimer(
+		"allocator_actions",
+		"The number of seconds it takes the allocator to perform some action",
+		"action",
+	)
+
+	storeLockHeld = ns.NewLabeledTimer(
+		"store_lock_held",
+		"The number of seconds the allocator holds open store transactions",
+		"object",
+	)
+
+	batchProcessingDuration = ns.NewTimer(
+		"batch_duration",
+		"The number of seconds it takes to process a full batch of allocations",
+	)
+
+	metrics.Register(ns)
+}
+
 type NewAllocator struct {
 	store   *store.MemoryStore
 	network network.Allocator
+
+	// fields that make running the allocator thread-safe.
+	runOnce sync.Once
+
+	// fields to make stopping the allocator possible and safe through the stop
+	// method
+	stop     chan struct{}
+	stopped  chan struct{}
+	stopOnce sync.Once
 
 	pendingMu       sync.Mutex
 	pendingNetworks map[string]struct{}
@@ -37,6 +77,8 @@ type NewAllocator struct {
 func NewNew(store *store.MemoryStore, pg plugingetter.PluginGetter) *NewAllocator {
 	a := &NewAllocator{
 		store:           store,
+		stop:            make(chan struct{}),
+		stopped:         make(chan struct{}),
 		network:         network.NewAllocator(pg),
 		pendingNetworks: map[string]struct{}{},
 		pendingTasks:    map[string]struct{}{},
@@ -46,6 +88,25 @@ func NewNew(store *store.MemoryStore, pg plugingetter.PluginGetter) *NewAllocato
 }
 
 func (a *NewAllocator) Run(ctx context.Context) error {
+	// TODO(dperny): probably should not use the network allocator's
+	// ErrBadState here but TBH it's more convenient then also importing, say,
+	// fmt
+
+	// initialize the variable err to be already started. this will get set to
+	// some other value (or even nil) when the allocator's run function exits,
+	// but any subsequent calls will not pass through the Once, and will return
+	// this error
+	err := errors.ErrBadState("allocator already started")
+	a.runOnce.Do(func() {
+		err = a.run(ctx)
+		// close the stopped channel to indicate that the allocator has fully
+		// exited.
+		close(a.stopped)
+	})
+	return err
+}
+
+func (a *NewAllocator) run(ctx context.Context) error {
 	// General overview of how this function works:
 	//
 	// Run is a shim between the asynchronous store interface, and the
@@ -84,6 +145,16 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 	ctx = log.WithModule(ctx, "allocator")
 	ctx = log.WithField(ctx, "method", "(*NewAllocator).Run")
 	log.G(ctx).Info("starting network allocator")
+
+	// set up a goroutine for stopping the allocator from the Stop method. this
+	// just cancels the context if that channel is closed.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-a.stop:
+			c()
+		}
+	}()
 
 	// we want to spend as little time as possible in transactions, because
 	// transactions stop the whole cluster, so we're going to grab the lists
@@ -138,7 +209,7 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			log.G(ctx).Info("context done, canceling the event stream")
+			log.G(ctx).Debug("context done, canceling the event stream")
 			cancel()
 		}
 	}()
@@ -163,12 +234,13 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 	}
 
 	log.G(ctx).Info("processing all outstanding allocations in the store")
-
 	a.processPendingAllocations(ctx)
+	log.G(ctx).Info("finished processing all pending allocations")
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	log.G(ctx).Info("starting event watch loop")
+	log.G(ctx).Debug("starting event watch loop")
 	// this goroutine handles incoming store events. all we need from the
 	// events is the ID of what has been updated. by the time we service the
 	// allocation, the object may have changed, so we don't save any other
@@ -203,36 +275,51 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 					// is already gone, deal with it
 					if ev.Network != nil {
 						a.pendingMu.Lock()
-						// when a network is deallocated, deallocate all nodes
-						// TODO(dperny): don't access the store in this event
-						// loop
-						a.store.Update(func(tx store.Tx) error {
-							nodes, err := store.FindNodes(tx, store.All)
-							if err != nil {
-								// TODO(dperny): better error handling
-								return err
-							}
-							for _, node := range nodes {
-								nwids := map[string]struct{}{}
-								for _, attachment := range node.Attachments {
-									if attachment.Network.ID != ev.Network.ID {
-										nwids[attachment.Network.ID] = struct{}{}
-									}
+						// when a network is deallocated, if it's an overlay
+						// network, before we can deallocate it we have to
+						// deallocate all of the attachments for its nodes.
+						if ev.Network.DriverState != nil && ev.Network.DriverState.Name == "overlay" {
+							a.store.Update(func(tx store.Tx) error {
+								storeDone := metrics.StartTimer(storeLockHeld.WithValues("network", "deallocate"))
+								defer storeDone()
+
+								nodes, err := store.FindNodes(tx, store.All)
+								if err != nil {
+									// TODO(dperny): better error handling
+									return err
 								}
-								if err := a.network.AllocateNode(node, nwids); err != nil {
-									if !errors.IsErrAlreadyAllocated(err) {
-										// TODO(dperny): better error handling
+								for _, node := range nodes {
+									a.pendingNodes[node.ID] = struct{}{}
+									nwids := map[string]struct{}{}
+									for _, attachment := range node.Attachments {
+										if attachment.Network.ID != ev.Network.ID {
+											nwids[attachment.Network.ID] = struct{}{}
+										}
+									}
+									allocDone := metrics.StartTimer(allocatorActions.WithValues("network", "allocate"))
+									err := a.network.AllocateNode(node, nwids)
+									allocDone()
+									if err != nil {
+										if !errors.IsErrAlreadyAllocated(err) {
+											// TODO(dperny): better error handling
+											return err
+										}
+									}
+									if err := store.UpdateNode(tx, node); err != nil {
 										return err
 									}
 								}
-								if err := store.UpdateNode(tx, node); err != nil {
-									return err
-								}
-							}
-							return nil
-						})
-						a.network.DeallocateNetwork(ev.Network)
+								return nil
+							})
+						}
+						allocDone := metrics.StartTimer(allocatorActions.WithValues("network", "deallocate"))
+						err := a.network.DeallocateNetwork(ev.Network)
+						allocDone()
+						if err != nil {
+							log.G(ctx).WithError(err).WithField("network.id", ev.Network.ID).Error("error deallocating network")
+						}
 						delete(a.pendingNetworks, ev.Network.ID)
+						log.G(ctx).Debugf("performed network delete in %s", elapsed)
 						a.pendingMu.Unlock()
 					}
 				// case api.EventCreateService, api.EventUpdateService:
@@ -244,7 +331,12 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 				case api.EventDeleteService:
 					if ev.Service != nil {
 						a.pendingMu.Lock()
-						a.network.DeallocateService(ev.Service)
+						allocDone := metrics.StartTimer(allocatorActions.WithValues("service", "deallocate"))
+						err := a.network.DeallocateService(ev.Service)
+						allocDone()
+						if err != nil {
+							log.G(ctx).WithField("service.id", ev.Service.ID).WithError(err).Error("error deallocating service")
+						}
 						a.pendingMu.Unlock()
 					}
 				case api.EventCreateTask, api.EventUpdateTask:
@@ -260,7 +352,12 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 						// resources just as if we had deleted it.
 						a.pendingMu.Lock()
 						if t.Status.State >= api.TaskStateCompleted {
-							a.network.DeallocateTask(t)
+							allocDone := metrics.StartTimer(allocatorActions.WithValues("task", "deallocate"))
+							err := a.network.DeallocateTask(t)
+							allocDone()
+							if err != nil {
+								log.G(ctx).WithField("task.id", t.ID).WithError(err).Error("error deallocating task")
+							}
 							// if the task was pending before now, remove it
 							// because it no loger is
 							delete(a.pendingTasks, t.ID)
@@ -272,7 +369,12 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 				case api.EventDeleteTask:
 					if ev.Task != nil {
 						a.pendingMu.Lock()
-						a.network.DeallocateTask(ev.Task)
+						allocDone := metrics.StartTimer(allocatorActions.WithValues("task", "deallocate"))
+						err := a.network.DeallocateTask(ev.Task)
+						allocDone()
+						if err != nil {
+							log.G(ctx).WithField("task.id", ev.Task.ID).WithError(err).Error("error deallocating task")
+						}
 						delete(a.pendingTasks, ev.Task.ID)
 						a.pendingMu.Unlock()
 					}
@@ -297,7 +399,7 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 		}
 	}()
 
-	log.G(ctx).Info("starting batch processing loop")
+	log.G(ctx).Debug("starting batch processing loop")
 	// allocations every 500 milliseconds
 	batchTimer := time.NewTimer(maxBatchInterval)
 	go func() {
@@ -319,27 +421,52 @@ func (a *NewAllocator) Run(ctx context.Context) error {
 		}
 	}()
 
-	log.G(ctx).Info("allocator is up!")
+	log.G(ctx).Info("allocator is started")
 	wg.Wait()
 	log.G(ctx).Info("allocator is finished")
-	defer log.G(ctx).Info("all defers exited")
-
+	defer log.G(ctx).Debug("all defers exited")
 	return nil
+}
+
+// Stop is a method that stops the running allocator, blocking until it has
+// fully stopped
+func (a *NewAllocator) Stop() {
+	a.stopOnce.Do(func() {
+		close(a.stop)
+	})
+	// NOTE(dperny) an un-selected channel read is inescapable and can result
+	// in deadlocks, however, being able to escape this channel read with, say,
+	// a context cancelation, would just lead to resource leaks of an already
+	// deadlocked allocator, so the risk of a deadlock isn't that important
+	<-a.stopped
 }
 
 func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 	ctx = log.WithField(ctx, "method", "(*NewAllocator).processPendingAllocations")
+
+	// we need to hold the lock the whole time we're allocating.
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
+
+	// collect metrics on how long each batch takes. start at timer after we
+	// acquire the lock, and then defer the done call
+	done := metrics.StartTimer(batchProcessingDuration)
+	defer done()
+
 	if err := a.store.Batch(func(batch *store.Batch) error {
 		if len(a.pendingNetworks) > 0 {
-			log.G(ctx).Infof("allocating %v networks", len(a.pendingNetworks))
+			log.G(ctx).Debugf("allocating %v networks", len(a.pendingNetworks))
 		}
 		for nwid := range a.pendingNetworks {
 			ctx := log.WithField(ctx, "network.id", nwid)
 			// don't actually return any errors from this function unless we
 			// want to abort the batch
 			if err := batch.Update(func(tx store.Tx) error {
+				// keep a timer of how long network allocation transactions
+				// take
+				batchDone := metrics.StartTimer(storeLockHeld.WithValues("network", "allocate"))
+				defer batchDone()
+
 				// get the most up-to-date information about the network
 				network := store.GetNetwork(tx, nwid)
 				// if we get back nil, the network may have been deleted, and
@@ -348,7 +475,11 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 					log.G(ctx).Debug("network not found, probably deleted")
 					return nil
 				}
-				if err := a.network.AllocateNetwork(network); err != nil {
+				// metrics on how long it takes to allocate a network
+				allocDone := metrics.StartTimer(allocatorActions.WithValues("network", "allocate"))
+				err := a.network.AllocateNetwork(network)
+				allocDone()
+				if err != nil {
 					if errors.IsErrAlreadyAllocated(err) {
 						log.G(ctx).Debug("network already allocated")
 						delete(a.pendingNetworks, nwid)
@@ -371,7 +502,7 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 				// if this is an overlay network, reallocate all of the nodes
 				// (to attach them to this overlay)
 				if network.DriverState != nil && network.DriverState.Name == "overlay" {
-					log.G(ctx).Info("added an overlay network, reallocating all nodes")
+					log.G(ctx).Debug("added an overlay network, reallocating all nodes")
 					nodes, err := store.FindNodes(tx, store.All)
 					if err != nil {
 						// TODO(dperny): again, can we handle errors better?
@@ -386,14 +517,17 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 				log.G(ctx).WithError(err).Error("batch update of network allocation failed")
 			}
 		}
-		log.G(ctx).Info("finished allocating networks")
+		log.G(ctx).Debug("finished allocating networks")
 
 		if len(a.pendingTasks) > 0 {
-			log.G(ctx).Infof("allocating %v tasks", len(a.pendingTasks))
+			log.G(ctx).Debugf("allocating %v tasks", len(a.pendingTasks))
 		}
 		for taskid := range a.pendingTasks {
 			ctx := log.WithField(ctx, "task.id", taskid)
 			if err := batch.Update(func(tx store.Tx) error {
+				batchDone := metrics.StartTimer(storeLockHeld.WithValues("task", "allocate"))
+				defer batchDone()
+
 				err := a.allocateTask(tx, taskid)
 				if err != nil && !errors.IsErrAlreadyAllocated(err) {
 					log.G(ctx).WithError(err).Error("task allocation failed")
@@ -409,16 +543,17 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 				log.G(ctx).WithError(err).Error("error in batch update")
 			}
 		}
-		log.G(ctx).Info("finished allocating tasks")
+		log.G(ctx).Debug("finished allocating tasks")
 
 		if len(a.pendingNodes) > 0 {
-			log.G(ctx).Infof("allocating %v nodes", len(a.pendingNodes))
+			log.G(ctx).Debugf("allocating %v nodes", len(a.pendingNodes))
 		}
 		// TODO(dperny): this is a really sloppy way of logging this once.
 		var logged bool
 		for nodeid := range a.pendingNodes {
 			ctx := log.WithField(ctx, "node.id", nodeid)
 			if err := batch.Update(func(tx store.Tx) error {
+				batchDone := metrics.StartTimer(storeLockHeld.WithValues("node", "allocate"))
 				networks, err := store.FindNetworks(tx, store.All)
 				if err != nil {
 					// TODO(dperny): better error handling
@@ -436,24 +571,46 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 				}
 
 				if !logged {
-					log.G(ctx).Infof("allocating %v networks for nodes", len(nwids))
+					log.G(ctx).Debugf("allocating %v networks for nodes", len(nwids))
 					logged = true
 				}
 
 				node := store.GetNode(tx, nodeid)
+				// TODO(dperny): this block is part of docker/swarmkit#2621 and
+				// should be uncommented when this code is rebased and includes
+				// the test changes from that
+				// we only allocate all overlay networks for windows nodes. if
+				// a node is not a windows node, set the nwids map to "nil",
+				// which will cause the allocator to only allocate the ingress
+				// network.
+				// if node.Description == nil || node.Description.Platform == nil || node.Description.Platform.OS != "windows" {
+				//     nwids = nil
+				// }
+				allocDone := metrics.StartTimer(allocatorActions.WithValues("node", "allocate"))
 				err = a.network.AllocateNode(node, nwids)
-				// if there is any error case other than already allocated, log
-				// it
+				allocDone()
+				// there are a lot of if statements, but this is mostly complex
+				// just to make logging behave a certain way
+
+				// first, if there is an error that isn't ErrAlreadyAllocated,
+				// then we log that; those errors are important
 				if err != nil && !errors.IsErrAlreadyAllocated(err) {
 					log.G(ctx).WithError(err).Error("error allocating node")
 				}
-				if !errors.IsErrRetryable(err) || errors.IsErrAlreadyAllocated(err) {
+				// next, if the error isn't retryable (which includes both no
+				// error and ErrAlreadyAllocated), then we should remove the
+				// node from the map so as not to try allocating it next batch
+				if !errors.IsErrRetryable(err) {
 					delete(a.pendingNodes, nodeid)
 				}
-				// TODO(dperny): this is too verbose logging
+				// next, if this is ErrAlreadyAllocated, log it at a debug
+				// level. it's a mildly noteworthy event if we try to allocate
+				// a node that is already fully allocated.
 				if errors.IsErrAlreadyAllocated(err) {
-					log.G(ctx).Info("node is already fully allocated")
+					log.G(ctx).Debug("node is already fully allocated")
 				}
+				// finally, if there was no error at all, then we should update
+				// the node object in the store.
 				if err == nil {
 					return store.UpdateNode(tx, node)
 				}
@@ -462,8 +619,8 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 				log.G(ctx).WithError(err).Error("error in batch update")
 			}
 		}
-		log.G(ctx).Info("finished allocating nodes")
-		log.G(ctx).Info("finished all allocations")
+		log.G(ctx).Debug("finished allocating nodes")
+		log.G(ctx).Debug("finished all allocations")
 		return nil
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("error processing pending allocations batch")
@@ -481,7 +638,9 @@ func (a *NewAllocator) allocateTask(tx store.Tx, taskid string) error {
 		if service == nil {
 			return nil
 		}
+		allocDone := metrics.StartTimer(allocatorActions.WithValues("service", "allocate"))
 		err := a.network.AllocateService(service)
+		allocDone()
 		if err != nil && !errors.IsErrAlreadyAllocated(err) {
 			return err
 		}
@@ -491,7 +650,11 @@ func (a *NewAllocator) allocateTask(tx store.Tx, taskid string) error {
 			}
 		}
 	}
+
+	allocDone := metrics.StartTimer(allocatorActions.WithValues("task", "allocate"))
 	err := a.network.AllocateTask(task)
+	allocDone()
+
 	if errors.IsErrAlreadyAllocated(err) {
 		return nil
 	}
