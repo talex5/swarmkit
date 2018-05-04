@@ -105,7 +105,7 @@ func (mr *MockAllocatorMockRecorder) DeallocateNetwork(arg0 interface{}) *gomock
 }
 
 // AllocateVIPs mocks base method
-func (m *MockAllocator) AllocateVIPs(arg0 *api.Endpoint, arg1 []string) error {
+func (m *MockAllocator) AllocateVIPs(arg0 *api.Endpoint, arg1 map[string]struct{}) error {
 	ret := m.ctrl.Call(m, "AllocateVIPs", arg0, arg1)
 	ret0, _ := ret[0].(error)
 	return ret0

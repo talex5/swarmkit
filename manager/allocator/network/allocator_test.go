@@ -17,6 +17,28 @@ import (
 	"github.com/golang/mock/gomock"
 )
 
+// the creation of port.Proposal objects is restricted to the port package, so
+// we'll create a quick fake here. using a fake instead of a proper generated
+// gomock mock because gomock is too heavyweight for this lightweight
+// dependency.
+type fakeProposal struct {
+	ports       []*api.PortConfig
+	isNoop      bool
+	isCommitted bool
+}
+
+func (f *fakeProposal) Ports() []*api.PortConfig {
+	return f.ports
+}
+
+func (f *fakeProposal) IsNoop() bool {
+	return f.isNoop
+}
+
+func (f *fakeProposal) Commit() {
+	f.isCommitted = true
+}
+
 var _ = Describe("network.Allocator", func() {
 	var (
 		a *allocator
@@ -570,16 +592,274 @@ var _ = Describe("network.Allocator", func() {
 					// covered by gomock
 				})
 			})
-			PContext("when the port allocator returns an error", func() {
+			Context("when the port allocator returns an error", func() {
+				var (
+					serviceCopy *api.Service
+				)
 				BeforeEach(func() {
-
+					service = &api.Service{
+						ID: "portErrService",
+						Spec: api.ServiceSpec{
+							Endpoint: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort:    80,
+										PublishedPort: 8080,
+										Protocol:      api.ProtocolTCP,
+									},
+								},
+							},
+						},
+					}
+					serviceCopy = service.Copy()
+					mockPort.EXPECT().Allocate(
+						&api.Endpoint{}, service.Spec.Endpoint,
+					).Return(nil, errors.ErrResourceInUse("port", "8080/TCP"))
+				})
+				It("should not alter the object", func() {
+					Expect(service).To(Equal(serviceCopy))
+				})
+				It("should not cache the service", func() {
+					Expect(a.services).NotTo(HaveKey("portErrService"))
+				})
+				It("should return an error", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(WithTransform(errors.IsErrResourceInUse, BeTrue()))
+					Expect(err.Error()).To(Equal("port 8080/TCP is in use"))
 				})
 			})
-			PContext("when the IPAM allocator returns an error", func() {
+			Context("when the IPAM allocator returns an error", func() {
+				var (
+					prop        *fakeProposal
+					serviceCopy *api.Service
+				)
+				BeforeEach(func() {
+					service = &api.Service{
+						ID: "portExposedService",
+						Spec: api.ServiceSpec{
+							Task: api.TaskSpec{
+								Networks: []*api.NetworkAttachmentConfig{
+									{
+										Target: "nw1",
+									},
+								},
+							},
+							Endpoint: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort:    777,
+										PublishedPort: 999,
+										PublishMode:   api.PublishModeIngress,
+										Protocol:      api.ProtocolTCP,
+									},
+								},
+							},
+						},
+					}
+					serviceCopy = service.Copy()
+					prop = &fakeProposal{
+						ports: []*api.PortConfig{
+							{
+								TargetPort:    777,
+								PublishedPort: 999,
+								PublishMode:   api.PublishModeIngress,
+								Protocol:      api.ProtocolTCP,
+							},
+						},
+					}
+					mockPort.EXPECT().Allocate(
+						&api.Endpoint{}, service.Spec.Endpoint,
+					).Return(prop, nil)
+					mockIpam.EXPECT().AllocateVIPs(
+						&api.Endpoint{},
+						map[string]struct{}{"ingress": {}, "nw1": {}},
+					).Return(errors.ErrResourceExhausted("ip address", "pool is full"))
+				})
+				It("should not commit the port allocator proposal", func() {
+					Expect(prop.isCommitted).To(BeFalse())
+				})
+				It("should not modify the service object", func() {
+					Expect(service).To(Equal(serviceCopy))
+				})
+				It("should return an error", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(WithTransform(
+						errors.IsErrResourceExhausted, BeTrue(),
+					))
+				})
 			})
-			PContext("when the IPAM allocator return ErrAlreadyAllocated", func() {
+
+			Context("when the IPAM allocator return ErrAlreadyAllocated", func() {
+				var (
+					prop *fakeProposal
+				)
+				BeforeEach(func() {
+					service = &api.Service{
+						ID: "portExposedService",
+						Spec: api.ServiceSpec{
+							Task: api.TaskSpec{
+								Networks: []*api.NetworkAttachmentConfig{},
+							},
+							Endpoint: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort:    777,
+										PublishedPort: 999,
+										PublishMode:   api.PublishModeIngress,
+										Protocol:      api.ProtocolTCP,
+									},
+								},
+							},
+						},
+						Endpoint: &api.Endpoint{
+							Spec: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort:    777,
+										PublishedPort: 777,
+										PublishMode:   api.PublishModeIngress,
+										Protocol:      api.ProtocolTCP,
+									},
+								},
+							},
+							Ports: []*api.PortConfig{
+								{
+									TargetPort:    777,
+									PublishedPort: 777,
+									PublishMode:   api.PublishModeIngress,
+									Protocol:      api.ProtocolTCP,
+								},
+							},
+							VirtualIPs: []*api.Endpoint_VirtualIP{
+								{
+									NetworkID: "ingress",
+									Addr:      "192.168.3.123/24",
+								},
+							},
+						},
+					}
+					prop = &fakeProposal{
+						ports: []*api.PortConfig{
+							{
+								TargetPort:    777,
+								PublishedPort: 999,
+								PublishMode:   api.PublishModeIngress,
+								Protocol:      api.ProtocolTCP,
+							},
+						},
+					}
+					mockPort.EXPECT().Allocate(
+						service.Endpoint, service.Spec.Endpoint,
+					).Return(prop, nil)
+					mockIpam.EXPECT().AllocateVIPs(
+						service.Endpoint,
+						map[string]struct{}{"ingress": {}},
+					).Return(errors.ErrAlreadyAllocated())
+				})
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should commit the port allocations", func() {
+					Expect(prop.isCommitted).To(BeTrue())
+				})
+				It("should cache the service", func() {
+					Expect(a.services).To(HaveKey(service.ID))
+					Expect(a.services[service.ID]).To(Equal(service))
+				})
 			})
-			PContext("when the service exposes ports, meaning it attaches to ingress", func() {
+			Context("when a new service with ports and attachments is allocated", func() {
+				var (
+					prop *fakeProposal
+				)
+				BeforeEach(func() {
+					service = &api.Service{
+						ID: "portExposedService",
+						Spec: api.ServiceSpec{
+							Task: api.TaskSpec{
+								Networks: []*api.NetworkAttachmentConfig{
+									{
+										Target: "nw1",
+									},
+								},
+							},
+							Endpoint: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort:    777,
+										PublishedPort: 999,
+										PublishMode:   api.PublishModeIngress,
+										Protocol:      api.ProtocolTCP,
+									},
+								},
+							},
+						},
+					}
+
+					prop = &fakeProposal{
+						ports: []*api.PortConfig{
+							{
+								TargetPort:    777,
+								PublishedPort: 999,
+								PublishMode:   api.PublishModeIngress,
+								Protocol:      api.ProtocolTCP,
+							},
+						},
+					}
+					mockPort.EXPECT().Allocate(
+						&api.Endpoint{}, service.Spec.Endpoint,
+					).Return(prop, nil)
+					mockIpam.EXPECT().AllocateVIPs(
+						&api.Endpoint{}, map[string]struct{}{"ingress": {}, "nw1": {}},
+					).Do(func(endpoint *api.Endpoint, _ map[string]struct{}) {
+						endpoint.VirtualIPs = []*api.Endpoint_VirtualIP{
+							{
+								NetworkID: "ingress",
+								Addr:      "192.168.4.123/24",
+							},
+							{
+								NetworkID: "nw1",
+								Addr:      "192.168.3.123/24",
+							},
+						}
+					}).Return(
+						nil,
+					)
+				})
+				It("should allocate a VIP on the ingress network", func() {
+					// covered by gomock
+				})
+				It("should return no error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should fill in the object's endpoint", func() {
+					Expect(service.Endpoint).ToNot(BeNil())
+					Expect(service.Endpoint.VirtualIPs).To(ConsistOf(
+						&api.Endpoint_VirtualIP{
+							NetworkID: "ingress",
+							Addr:      "192.168.4.123/24",
+						},
+						&api.Endpoint_VirtualIP{
+							NetworkID: "nw1",
+							Addr:      "192.168.3.123/24",
+						},
+					))
+					Expect(service.Endpoint.Ports).To(ConsistOf(
+						&api.PortConfig{
+							TargetPort:    777,
+							PublishedPort: 999,
+							PublishMode:   api.PublishModeIngress,
+							Protocol:      api.ProtocolTCP,
+						},
+					))
+					Expect(service.Endpoint.Spec).To(Equal(service.Spec.Endpoint))
+				})
+				It("should cache the service", func() {
+					Expect(a.services).To(HaveKey(service.ID))
+					Expect(a.services[service.ID]).To(Equal(service))
+				})
+				It("should commit the port allocation", func() {
+					Expect(prop.isCommitted).To(BeTrue())
+				})
 			})
 		})
 
@@ -593,7 +873,7 @@ var _ = Describe("network.Allocator", func() {
 		})
 	})
 
-	Describe("IsServiceFullyAllocated", func() {
+	Describe("isServiceFullyAllocated", func() {
 		var (
 			service *api.Service
 			result  bool

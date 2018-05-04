@@ -32,7 +32,7 @@ func TestErrDependencyNotAllocated(t *testing.T) {
 	t.Parallel()
 
 	err := ErrDependencyNotAllocated("network", "someid")
-	require.EqualError(t, err, "network \"someid\" depended on by object is not allocated")
+	require.EqualError(t, err, "network someid depended on by object is not allocated")
 	require.True(t, IsErrDependencyNotAllocated(err))
 	require.True(t, IsErrRetryable(err))
 }

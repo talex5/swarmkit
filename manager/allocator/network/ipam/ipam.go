@@ -39,7 +39,7 @@ type Allocator interface {
 	Restore([]*api.Network, []*api.Endpoint, []*api.NetworkAttachment) error
 	AllocateNetwork(*api.Network) error
 	DeallocateNetwork(*api.Network)
-	AllocateVIPs(*api.Endpoint, []string) error
+	AllocateVIPs(*api.Endpoint, map[string]struct{}) error
 	DeallocateVIPs(*api.Endpoint)
 	AllocateAttachment(*api.NetworkAttachmentConfig) (*api.NetworkAttachment, error)
 	DeallocateAttachment(*api.NetworkAttachment) error
@@ -498,7 +498,7 @@ func (a *allocator) DeallocateNetwork(network *api.Network) {
 }
 
 // AllocateVIPs allocates the VIPs for the provided endpoint and network ids.
-func (a *allocator) AllocateVIPs(endpoint *api.Endpoint, networkIDs []string) (rerr error) {
+func (a *allocator) AllocateVIPs(endpoint *api.Endpoint, networkIDs map[string]struct{}) (rerr error) {
 	// if the endpoint spec mode has changed to DNSRR, then what we're actually
 	// doing is freeing all of the endpoint specs.
 	if endpoint.Spec != nil {
@@ -510,7 +510,7 @@ func (a *allocator) AllocateVIPs(endpoint *api.Endpoint, networkIDs []string) (r
 	// first, go through and check that every network we want a VIP for is
 	// allocated. if not, return an error. We can't allocate VIPs until the
 	// network is allocated
-	for _, nwid := range networkIDs {
+	for nwid := range networkIDs {
 		if _, ok := a.networks[nwid]; !ok {
 			return errors.ErrDependencyNotAllocated("network", nwid)
 		}
@@ -535,21 +535,18 @@ func (a *allocator) AllocateVIPs(endpoint *api.Endpoint, networkIDs []string) (r
 	//     if we get to this point, then we have been through every desired
 	//     network ID and not found one matching the one on this VIP, so we
 	//     can add it to the list of VIPs to deallocate
-vips:
 	for _, vip := range endpoint.VirtualIPs {
-		for _, nwid := range networkIDs {
-			if vip.NetworkID == nwid {
-				keep = append(keep, vip)
-				continue vips
-			}
+		if _, ok := networkIDs[vip.NetworkID]; ok {
+			keep = append(keep, vip)
+		} else {
+			deallocate = append(deallocate, vip)
 		}
-		deallocate = append(deallocate, vip)
 	}
 
 	// now figure out which new network IDs we've added, which is the same loop
 	// above but swapped around to check network IDs against VIPs
 newvips:
-	for _, nwid := range networkIDs {
+	for nwid := range networkIDs {
 		for _, vip := range endpoint.VirtualIPs {
 			if vip.NetworkID == nwid {
 				continue newvips

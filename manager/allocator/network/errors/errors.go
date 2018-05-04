@@ -39,7 +39,7 @@ func ErrDependencyNotAllocated(objectType string, id string) error {
 
 // Error returns the error message
 func (e errDependencyNotAllocated) Error() string {
-	return fmt.Sprintf("%v %q depended on by object is not allocated", e.objectType, e.id)
+	return fmt.Sprintf("%v %s depended on by object is not allocated", e.objectType, e.id)
 }
 
 // IsErrDependencyNotAllocated returns true if this error is a result of a

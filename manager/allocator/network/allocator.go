@@ -298,13 +298,13 @@ func (a *allocator) AllocateService(service *api.Service) error {
 	if len(service.Spec.Task.Networks) == 0 && len(service.Spec.Networks) != 0 {
 		networks = service.Spec.Networks
 	}
-	ids := make([]string, 0, len(networks))
+	ids := make(map[string]struct{}, len(networks))
 	// build up a list of network ids to allocate vips for
 	for _, nw := range networks {
 		// we don't allocate VIPs for node-local networks, so if the network is
 		// found in the nodeLocalNetworks set, skip it
 		if _, ok := a.nodeLocalNetworks[nw.Target]; !ok {
-			ids = append(ids, nw.Target)
+			ids[nw.Target] = struct{}{}
 		}
 	}
 
@@ -313,7 +313,7 @@ func (a *allocator) AllocateService(service *api.Service) error {
 	// actual objects, it should have a VIP. so, if we need it, append it to
 	// the list of network IDs we're requesting VIPs for.
 	if ingressNeeded(proposal.Ports()) {
-		ids = append(ids, a.ingressID)
+		ids[a.ingressID] = struct{}{}
 	}
 
 	if err := a.ipam.AllocateVIPs(endpoint, ids); err != nil {
