@@ -405,6 +405,14 @@ var _ = Describe("network.Allocator", func() {
 				It("should return no error", func() {
 					Expect(err).ToNot(HaveOccurred())
 				})
+				Context("when the network is an ingress network", func() {
+					BeforeEach(func() {
+						net.Spec.Ingress = true
+					})
+					It("should set the ingress ID", func() {
+						Expect(a.ingressID).To(Equal("net1"))
+					})
+				})
 			})
 			Context("when the network is node-local", func() {
 				BeforeEach(func() {
@@ -463,6 +471,41 @@ var _ = Describe("network.Allocator", func() {
 				})
 				It("should not modify the object", func() {
 					Expect(net).To(Equal(&api.Network{ID: "net1"}))
+				})
+			})
+		})
+
+		Describe("deallocating networks", func() {
+			var (
+				network *api.Network
+				err     error
+			)
+
+			BeforeEach(func() {
+				network = &api.Network{
+					ID: "ingressNet",
+					Spec: api.NetworkSpec{
+						Ingress: true,
+					},
+				}
+
+				// initialize an ingress network
+				initNetworks = append(initNetworks, network)
+			})
+
+			Context("when the ingress network is being deallocated", func() {
+				BeforeEach(func() {
+					mockDriver.EXPECT().Deallocate(network).Return(nil)
+					mockIpam.EXPECT().DeallocateNetwork(network)
+				})
+				JustBeforeEach(func() {
+					err = a.DeallocateNetwork(network)
+				})
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should unset the ingress ID", func() {
+					Expect(a.ingressID).To(Equal(""))
 				})
 			})
 		})
@@ -861,11 +904,226 @@ var _ = Describe("network.Allocator", func() {
 					Expect(prop.isCommitted).To(BeTrue())
 				})
 			})
+			Context("when no ingress network is currently allocated", func() {
+				BeforeEach(func() {
+					// clear out initNetworks and initServices, so that no
+					// ingress network and no service will be restored, and we
+					// have a clean allocator
+					initNetworks = []*api.Network{}
+
+					// create a minimal service that exposes some ports, so the
+					// network will try to attach to ingress
+					service = &api.Service{
+						Spec: api.ServiceSpec{
+							Endpoint: &api.EndpointSpec{
+								Ports: []*api.PortConfig{
+									{
+										TargetPort: 80,
+										Protocol:   api.ProtocolTCP,
+									},
+								},
+							},
+						},
+					}
+
+					mockPort.EXPECT().Allocate(&api.Endpoint{}, service.Spec.Endpoint).Return(
+						&fakeProposal{
+							ports: []*api.PortConfig{
+								{
+									TargetPort:    80,
+									Protocol:      api.ProtocolTCP,
+									PublishMode:   api.PublishModeIngress,
+									PublishedPort: 30303,
+								},
+							},
+						}, nil,
+					)
+				})
+
+				It("should fail with ErrDependencyNotAllocated", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(WithTransform(errors.IsErrDependencyNotAllocated, BeTrue()))
+					Expect(err.Error()).To(Equal("network ingress depended on by object is not allocated"))
+				})
+			})
 		})
 
-		PDescribe("allocating tasks", func() {
-			BeforeEach(func() {
+		Describe("allocating tasks", func() {
+			var (
+				service *api.Service
+				task    *api.Task
+				err     error
 
+				ingress, localnet, nw1, nw2 *api.Network
+			)
+			BeforeEach(func() {
+				// we'll need an ingress network for these tests, so add one to
+				// the initNetworks
+				ingress = &api.Network{
+					ID: "allocTaskIngressNw",
+					Spec: api.NetworkSpec{
+						Ingress: true,
+					},
+				}
+
+				// add a node-local network, which shouldn't be allocated on
+				// the task
+				localnet = &api.Network{
+					ID: "allocTaskLocalNw",
+					Spec: api.NetworkSpec{
+						DriverConfig: &api.Driver{
+							Name: "local",
+						},
+					},
+					DriverState: &api.Driver{
+						Name: "local",
+					},
+				}
+
+				nw1 = &api.Network{
+					ID: "allocTaskNw1",
+				}
+				nw2 = &api.Network{
+					ID: "allocTaskNw2",
+				}
+
+				initNetworks = append(initNetworks, ingress, localnet, nw1, nw1)
+
+				// create a service which will be for our tasks
+				service = &api.Service{
+					ID: "allocTaskService",
+					Endpoint: &api.Endpoint{
+						Spec: &api.EndpointSpec{
+							Mode: api.ResolutionModeVirtualIP,
+							Ports: []*api.PortConfig{
+								{
+									TargetPort:    80,
+									PublishedPort: 80,
+									Protocol:      api.ProtocolTCP,
+									PublishMode:   api.PublishModeIngress,
+								},
+							},
+						},
+						Ports: []*api.PortConfig{
+							{
+								TargetPort:    80,
+								PublishedPort: 80,
+								Protocol:      api.ProtocolTCP,
+								PublishMode:   api.PublishModeIngress,
+							},
+						},
+						VirtualIPs: []*api.Endpoint_VirtualIP{
+							&api.Endpoint_VirtualIP{
+								NetworkID: "allocTaskNw1",
+							},
+							&api.Endpoint_VirtualIP{
+								NetworkID: "allocTaskNw2",
+							},
+							&api.Endpoint_VirtualIP{
+								NetworkID: "allocTaskIngressNw",
+							},
+						},
+					},
+					Spec: api.ServiceSpec{
+						Task: api.TaskSpec{
+							Networks: []*api.NetworkAttachmentConfig{
+								{
+									Target: "allocTaskLocalNw",
+									// include some opts so that we can be sure
+									// fields are correctly carried
+									DriverAttachmentOpts: map[string]string{
+										"foo": "bar",
+									},
+								},
+								{
+									Target: "allocTaskNw1",
+								},
+								{
+									Target: "allocTaskNw2",
+								},
+							},
+						},
+						Endpoint: &api.EndpointSpec{
+							Mode: api.ResolutionModeVirtualIP,
+							Ports: []*api.PortConfig{
+								{
+									TargetPort:    80,
+									PublishedPort: 80,
+									Protocol:      api.ProtocolTCP,
+									PublishMode:   api.PublishModeIngress,
+								},
+							},
+						},
+					},
+				}
+				initServices = append(initServices, service)
+			})
+
+			JustBeforeEach(func() {
+				// allocate the task object
+				err = a.AllocateTask(task)
+			})
+
+			Context("when successfully allocating a task", func() {
+				BeforeEach(func() {
+					task = &api.Task{
+						ID: "allocTaskTask",
+						Status: api.TaskStatus{
+							State: api.TaskStateNew,
+						},
+						DesiredState: api.TaskStateRunning,
+						ServiceID:    service.ID,
+						Spec:         service.Spec.Task,
+					}
+					mockIpam.EXPECT().AllocateAttachment(
+						task.Spec.Networks[1],
+					).Return(
+						&api.NetworkAttachment{
+							Network: nw1,
+						}, nil,
+					)
+					mockIpam.EXPECT().AllocateAttachment(
+						task.Spec.Networks[2],
+					).Return(
+						&api.NetworkAttachment{
+							Network: nw2,
+						}, nil,
+					)
+					mockIpam.EXPECT().AllocateAttachment(
+						&api.NetworkAttachmentConfig{Target: ingress.ID},
+					).Return(
+						&api.NetworkAttachment{
+							Network: ingress,
+						}, nil,
+					)
+				})
+
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should fill in the task's networks", func() {
+					// including ingress and the local network
+					Expect(task.Networks).To(ConsistOf(
+						&api.NetworkAttachment{
+							Network: localnet,
+							DriverAttachmentOpts: map[string]string{
+								"foo": "bar",
+							},
+						},
+						&api.NetworkAttachment{
+							Network: nw1,
+						},
+						&api.NetworkAttachment{
+							Network: nw2,
+						},
+						&api.NetworkAttachment{
+							Network: ingress,
+						},
+					))
+				})
+				It("should populate the task's endpoint with the service's endpoint", func() {
+					Expect(task.Endpoint).To(Equal(service.Endpoint))
+				})
 			})
 		})
 
@@ -932,7 +1190,7 @@ var _ = Describe("network.Allocator", func() {
 				Expect(result).To(BeFalse())
 			})
 		})
-		Context("when the endpoint has VIPs for network", func() {
+		Context("when the endpoint has VIPs for the wrong networks", func() {
 			BeforeEach(func() {
 				service.Endpoint.VirtualIPs = []*api.Endpoint_VirtualIP{
 					{
@@ -972,12 +1230,53 @@ var _ = Describe("network.Allocator", func() {
 				Expect(result).To(BeFalse())
 			})
 		})
+
 		Context("when the service is totally empty", func() {
 			BeforeEach(func() {
 				service = &api.Service{ID: "foo"}
 			})
 			It("should return true", func() {
 				Expect(result).To(BeTrue())
+			})
+		})
+
+		Context("when the task spec has local networks", func() {
+			BeforeEach(func() {
+				a.nodeLocalNetworks["localnet"] = &api.Network{}
+				service.Spec.Task.Networks = []*api.NetworkAttachmentConfig{
+					{
+						Target: "localnet",
+					},
+				}
+			})
+			It("should return true", func() {
+				Expect(result).To(BeTrue())
+			})
+		})
+
+		Context("when a network has more than 1 vip allocated", func() {
+			BeforeEach(func() {
+				service.Endpoint.VirtualIPs = []*api.Endpoint_VirtualIP{
+					{
+						NetworkID: "nw1",
+						Addr:      "192.168.1.1/24",
+					},
+					{
+						NetworkID: "nw1",
+						Addr:      "192.168.2.1/24",
+					},
+				}
+				service.Spec.Task.Networks = []*api.NetworkAttachmentConfig{
+					{
+						Target: "nw1",
+					},
+					{
+						Target: "nw2",
+					},
+				}
+			})
+			It("should return false", func() {
+				Expect(result).To(BeFalse())
 			})
 		})
 	})

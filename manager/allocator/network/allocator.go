@@ -124,6 +124,7 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 	for _, nw := range networks {
 		// ingress networks should have the ingress field set on the spec
 		if nw.Spec.Ingress {
+			// TODO(dperny): handle partially allocated ingress networks
 			a.ingressID = nw.ID
 		}
 
@@ -133,6 +134,11 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 		if ok && nw.Spec.Annotations.Name == "ingress" {
 			a.ingressID = nw.ID
 		}
+
+		// TODO(dperny): this is broken. if the network is node local but not
+		// yet allocated, it will be stuck. the allocation doesn't really mean
+		// anything for a node-local network, but it does fill in driver name,
+		// for example. maybe we should just allocate here?
 		local, err := a.driver.IsNetworkNodeLocal(nw)
 		if err != nil {
 			return err
@@ -220,6 +226,20 @@ func (a *allocator) AllocateNetwork(n *api.Network) error {
 		a.ipam.DeallocateNetwork(n)
 		return err
 	}
+	// TODO(dperny): return an error if we try to allocate a second ingress
+	if a.ingressID == "" {
+		// ingress networks should have the ingress field set on the spec
+		if n.Spec.Ingress {
+			a.ingressID = n.ID
+		}
+
+		// however, some older networks indicate that they're ingress with
+		// labels.
+		_, ok := n.Spec.Annotations.Labels["com.docker.swarm.internal"]
+		if ok && n.Spec.Annotations.Name == "ingress" {
+			a.ingressID = n.ID
+		}
+	}
 	return nil
 }
 
@@ -230,6 +250,12 @@ func (a *allocator) DeallocateNetwork(n *api.Network) error {
 	if err := a.driver.Deallocate(n); err != nil {
 		return err
 	}
+
+	// if the network being removed is ingress, clear out the ingress ID.
+	if n.ID == a.ingressID {
+		a.ingressID = ""
+	}
+
 	a.ipam.DeallocateNetwork(n)
 	return nil
 }
@@ -313,7 +339,17 @@ func (a *allocator) AllocateService(service *api.Service) error {
 	// actual objects, it should have a VIP. so, if we need it, append it to
 	// the list of network IDs we're requesting VIPs for.
 	if ingressNeeded(proposal.Ports()) {
-		ids[a.ingressID] = struct{}{}
+		if a.ingressID != "" {
+			ids[a.ingressID] = struct{}{}
+		} else {
+			// if we need an ingress network, but we don't currently have one,
+			// then the dependencies for this service are not allocated. if we
+			// didn't return an error here, we would still get an
+			// ErrDependencyNotAllocated, but it would be from the IPAM
+			// allocator, complaining that network "" (empty string) was not
+			// allocated.
+			return errors.ErrDependencyNotAllocated("network", "ingress")
+		}
 	}
 
 	if err := a.ipam.AllocateVIPs(endpoint, ids); err != nil {
@@ -385,14 +421,20 @@ func (a *allocator) AllocateTask(task *api.Task) (rerr error) {
 	// ingress network.
 	attachmentConfigs := task.Spec.Networks
 	if task.Endpoint != nil && ingressNeeded(task.Endpoint.Ports) {
-		// NOTE(dperny): if i recall correctly, append should not modify the
-		// original slice here, which means this is safe to do without
-		// accidentally modifying the spec.
-		attachmentConfigs = append(attachmentConfigs,
-			// we only need to provide the ingress ID as the target in a
-			// network attachment config.
-			&api.NetworkAttachmentConfig{Target: a.ingressID},
-		)
+		if a.ingressID != "" {
+			// NOTE(dperny): if i recall correctly, append should not modify the
+			// original slice here, which means this is safe to do without
+			// accidentally modifying the spec.
+			attachmentConfigs = append(attachmentConfigs,
+				// we only need to provide the ingress ID as the target in a
+				// network attachment config.
+				&api.NetworkAttachmentConfig{Target: a.ingressID},
+			)
+		} else {
+			// see the explanation of this error in the analogous code block in
+			// AllocateService
+			return errors.ErrDependencyNotAllocated("network", "ingress")
+		}
 	}
 	// set up a slice to contain all of the attachments we will create
 	finalAttachments := make([]*api.NetworkAttachment, 0, len(attachmentConfigs))
@@ -597,21 +639,12 @@ func (a *allocator) isServiceFullyAllocated(service *api.Service) bool {
 	}
 	// if we're using vips, check that we're using the right vips
 	if spec.Mode == api.ResolutionModeVirtualIP {
-		// how many networks should we have? the same number as our spec's
-		// attachments, plus ingress if we need it. ingress cannot be
-		// attached to normally, so will not be in the spec's network
-		// attachments, but if it is needed it should be in the service's
-		// VIPs.
-		expectedNetworks := len(service.Spec.Task.Networks)
 		ingress := ingressNeeded(spec.Ports)
-		if ingress {
-			expectedNetworks = expectedNetworks + 1
-		}
-		// if there are differing numbers of VIPs and attachments, we have
-		// some allocation or deallocation to do
-		if len(endpoint.VirtualIPs) != expectedNetworks {
-			return false
-		}
+		// networksWithVips is a map of all the network IDs that are present
+		// in the VIPs, which tells us if every network attachment has a VIP
+		// allocated. this catches a bizarre edge case where a network has two
+		// vips.
+		networksWithVips := map[string]struct{}{}
 		// i'm not totally happy with this part because I think it slightly
 		// breaks the separation of concerns, but i think it's more
 		// important to guard the ipam package from the details of services
@@ -627,14 +660,22 @@ func (a *allocator) isServiceFullyAllocated(service *api.Service) bool {
 			// networks loop without continuing, and then return false
 			// because it's not supposed to be there.
 			if ingress && vip.NetworkID == a.ingressID {
+				networksWithVips[vip.NetworkID] = struct{}{}
 				continue vipsLoop
 			}
 			// NOTE(dperny): this does _not_ cover the deprecated
 			// service.Spec.Networks field.
 			for _, nw := range service.Spec.Task.Networks {
 				if nw != nil && nw.Target == vip.NetworkID {
+					// if the network is node local, then we are not fully
+					// allocated because we have a vip for a network that
+					// shouldn't have one
+					if _, ok := a.nodeLocalNetworks[nw.Target]; ok {
+						return false
+					}
 					// if we find a target that matches this vip, then
 					// we can go to the next VIP and check it
+					networksWithVips[vip.NetworkID] = struct{}{}
 					continue vipsLoop
 				}
 			}
@@ -642,6 +683,18 @@ func (a *allocator) isServiceFullyAllocated(service *api.Service) bool {
 			// nothing matching this VIP, the service isn't fully
 			// allocated
 			return false
+		}
+
+		// now check that every network that should have a vip has one
+		for _, attach := range service.Spec.Task.Networks {
+			// skip any node-local networks, which should not have attachments
+			if _, ok := a.nodeLocalNetworks[attach.Target]; !ok {
+				// if we have a network attachment without a corresponding VIP,
+				// then we're not fully allocated
+				if _, ok := networksWithVips[attach.Target]; !ok {
+					return false
+				}
+			}
 		}
 	}
 	// if we got this far, and the ports are also already allocated,
