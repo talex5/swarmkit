@@ -279,6 +279,9 @@ func (a *NewAllocator) run(ctx context.Context) error {
 						// network, before we can deallocate it we have to
 						// deallocate all of the attachments for its nodes.
 						if ev.Network.DriverState != nil && ev.Network.DriverState.Name == "overlay" {
+							// TODO(dperny): doing a store update in this event
+							// loop is probably pretty much the worst thing I
+							// can imagine doing for performance.
 							a.store.Update(func(tx store.Tx) error {
 								storeDone := metrics.StartTimer(storeLockHeld.WithValues("network", "deallocate"))
 								defer storeDone()
