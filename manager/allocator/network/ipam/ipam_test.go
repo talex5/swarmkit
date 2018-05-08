@@ -1098,7 +1098,7 @@ var _ = Describe("ipam.Allocator", func() {
 				var err error
 				BeforeEach(func() {
 					e := &api.Endpoint{}
-					err = a.AllocateVIPs(e, map[string]struct{}{"notreal": struct{}{}})
+					err = a.AllocateVIPs(e, map[string]struct{}{"notreal": {}})
 				})
 				It("should fail with ErrDependencyNotAllocated", func() {
 					Expect(err).To(HaveOccurred())
@@ -1113,7 +1113,7 @@ var _ = Describe("ipam.Allocator", func() {
 				)
 				BeforeEach(func() {
 					endpoint = &api.Endpoint{}
-					err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw1": struct{}{}, "nw2": struct{}{}})
+					err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw1": {}, "nw2": {}})
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -1156,7 +1156,7 @@ var _ = Describe("ipam.Allocator", func() {
 						err error
 					)
 					BeforeEach(func() {
-						err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw1": struct{}{}, "nw2": struct{}{}})
+						err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw1": {}, "nw2": {}})
 					})
 					It("should succeed", func() {
 						Expect(err).ToNot(HaveOccurred())
@@ -1200,7 +1200,7 @@ var _ = Describe("ipam.Allocator", func() {
 						err error
 					)
 					BeforeEach(func() {
-						err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw2": struct{}{}})
+						err = a.AllocateVIPs(endpoint, map[string]struct{}{"nw2": {}})
 					})
 					It("should succeed", func() {
 						Expect(err).ToNot(HaveOccurred())

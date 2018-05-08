@@ -755,7 +755,7 @@ func (a *allocator) DeallocateAttachment(attachment *api.NetworkAttachment) erro
 	ipam, _ := a.drvRegistry.IPAM(local.nw.IPAM.Driver.Name)
 
 	// if we get an error, we are going to continue through the function, but
-	// we will return the last error we recieve. this could mean we drop some
+	// we will return the last error we receive. this could mean we drop some
 	// errors, but it's very likely that this will only ever de-allocate 1
 	// address at a time, and even if there are more than 1 the error will
 	// probably be the same each time

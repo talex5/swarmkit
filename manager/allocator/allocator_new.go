@@ -18,6 +18,8 @@ import (
 )
 
 const (
+	// AllocatedStatusMessage is the message added to a task status after the
+	// task is successfully allocated
 	AllocatedStatusMessage = "pending task scheduling"
 
 	maxBatchInterval = 500 * time.Millisecond
@@ -31,7 +33,7 @@ var (
 )
 
 func init() {
-	ns := metrics.NewNamespace("swarmkit", "allocator")
+	ns := metrics.NewNamespace("swarmkit", "allocator", nil)
 
 	allocatorActions = ns.NewLabeledTimer(
 		"allocator_actions",
@@ -53,6 +55,8 @@ func init() {
 	metrics.Register(ns)
 }
 
+// NewAllocator is the top-level component controlling resource allocation for
+// swarm objects
 type NewAllocator struct {
 	store   *store.MemoryStore
 	network network.Allocator
@@ -74,6 +78,7 @@ type NewAllocator struct {
 	// before we allocate a task
 }
 
+// NewNew creates a NewAllocator object
 func NewNew(store *store.MemoryStore, pg plugingetter.PluginGetter) *NewAllocator {
 	a := &NewAllocator{
 		store:           store,
@@ -87,6 +92,8 @@ func NewNew(store *store.MemoryStore, pg plugingetter.PluginGetter) *NewAllocato
 	return a
 }
 
+// Run starts this allocator, if it has not yet been started. The Allocator can
+// only be run once.
 func (a *NewAllocator) Run(ctx context.Context) error {
 	// TODO(dperny): probably should not use the network allocator's
 	// ErrBadState here but TBH it's more convenient then also importing, say,
@@ -135,7 +142,7 @@ func (a *NewAllocator) run(ctx context.Context) error {
 	// adds that to the work pile. We only deal with the ID, not the full
 	// object because the full object may have changed since the event came in
 	// The exception in this event loop is for deallocations. When an object is
-	// deleted, the event we recieve is our last chance to deal with that
+	// deleted, the event we receive is our last chance to deal with that
 	// object. In that case, we immediately call into Deallocate.
 
 	ctx, c := context.WithCancel(ctx)
@@ -322,7 +329,6 @@ func (a *NewAllocator) run(ctx context.Context) error {
 							log.G(ctx).WithError(err).WithField("network.id", ev.Network.ID).Error("error deallocating network")
 						}
 						delete(a.pendingNetworks, ev.Network.ID)
-						log.G(ctx).Debugf("performed network delete in %s", elapsed)
 						a.pendingMu.Unlock()
 					}
 				// case api.EventCreateService, api.EventUpdateService:
@@ -557,6 +563,7 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 			ctx := log.WithField(ctx, "node.id", nodeid)
 			if err := batch.Update(func(tx store.Tx) error {
 				batchDone := metrics.StartTimer(storeLockHeld.WithValues("node", "allocate"))
+				defer batchDone()
 				networks, err := store.FindNetworks(tx, store.All)
 				if err != nil {
 					// TODO(dperny): better error handling

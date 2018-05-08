@@ -481,7 +481,7 @@ func (a *allocator) AllocateTask(task *api.Task) (rerr error) {
 // If this method returns nil, the result of the task allocation should be
 // committed, if it is not being deleted.
 func (a *allocator) DeallocateTask(task *api.Task) error {
-	// keep track of the last error we recieve to return to the caller. even if
+	// keep track of the last error we receive to return to the caller. even if
 	// we get an error, we're going to keep going, because there is likely no
 	// sane or easy way to handle error conditions. by only taking the last
 	// error, we may drop some earlier errors, but it is more than likely that

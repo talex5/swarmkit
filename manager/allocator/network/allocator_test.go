@@ -551,7 +551,7 @@ var _ = Describe("network.Allocator", func() {
 						},
 						Task: api.TaskSpec{
 							Networks: []*api.NetworkAttachmentConfig{
-								&api.NetworkAttachmentConfig{
+								{
 									Target: "nw1",
 								},
 							},
@@ -580,11 +580,11 @@ var _ = Describe("network.Allocator", func() {
 							},
 						},
 						VirtualIPs: []*api.Endpoint_VirtualIP{
-							&api.Endpoint_VirtualIP{
+							{
 								Addr:      "192.168.3.3/24",
 								NetworkID: "nw1",
 							},
-							&api.Endpoint_VirtualIP{
+							{
 								Addr:      "192.168.4.3/24",
 								NetworkID: "ingress",
 							},
@@ -1013,13 +1013,13 @@ var _ = Describe("network.Allocator", func() {
 							},
 						},
 						VirtualIPs: []*api.Endpoint_VirtualIP{
-							&api.Endpoint_VirtualIP{
+							{
 								NetworkID: "allocTaskNw1",
 							},
-							&api.Endpoint_VirtualIP{
+							{
 								NetworkID: "allocTaskNw2",
 							},
-							&api.Endpoint_VirtualIP{
+							{
 								NetworkID: "allocTaskIngressNw",
 							},
 						},

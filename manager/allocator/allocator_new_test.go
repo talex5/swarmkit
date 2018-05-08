@@ -1208,12 +1208,12 @@ func TestNewAllocatorRestoreForUnallocatedNetwork(t *testing.T) {
 		}))
 	}
 
-	// there are no guarantees about which task recieves which IP, because they
+	// there are no guarantees about which task receives which IP, because they
 	// will be iterated through in random order
 	taskAvailableIPs := map[string]struct{}{
-		"10.1.0.5/24": struct{}{},
-		"10.1.0.6/24": struct{}{},
-		"10.1.0.7/24": struct{}{},
+		"10.1.0.5/24": {},
+		"10.1.0.6/24": {},
+		"10.1.0.7/24": {},
 	}
 	assignedIPs := make(map[string]bool)
 	expectedIPs := map[string]string{
@@ -1241,7 +1241,7 @@ func TestNewAllocatorRestoreForUnallocatedNetwork(t *testing.T) {
 			return false
 		}
 		// there are no guarantees about the order of network attachments in
-		// tasks, so we ened to figure them by iteratingj
+		// tasks, so we need to figure them by iterating
 		for _, attach := range task.Networks {
 			// this case covers the overlap network
 			if attach.Network.ID == "testID1" {
