@@ -38,13 +38,13 @@ func init() {
 	allocatorActions = ns.NewLabeledTimer(
 		"allocator_actions",
 		"The number of seconds it takes the allocator to perform some action",
-		"action",
+		"object", "action",
 	)
 
 	storeLockHeld = ns.NewLabeledTimer(
 		"store_lock_held",
 		"The number of seconds the allocator holds open store transactions",
-		"object",
+		"object", "action",
 	)
 
 	batchProcessingDuration = ns.NewTimer(
