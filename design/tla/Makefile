@@ -10,6 +10,7 @@ all: check pdfs tlaps
 check:
 	${TLA} tlc -workers ${WORKERS} SwarmKit.tla -config models/SwarmKit.cfg
 	${TLA} tlc -workers ${WORKERS} WorkerImpl.tla -config models/WorkerImpl.cfg
+	${TLA} tlc -workers ${WORKERS} PortAllocator.tla -config models/PortAllocator.cfg
 
 # Run the TLAPS proof checker
 tlaps:
@@ -21,4 +22,4 @@ tlaps:
 	[ -d metadir ] || mkdir metadir
 	${TLA} java tla2tex.TLA -shade -latexCommand pdflatex -latexOutputExt pdf -metadir metadir $<
 
-pdfs: SwarmKit.pdf Types.pdf Tasks.pdf WorkerSpec.pdf EventCounter.pdf
+pdfs: SwarmKit.pdf Types.pdf Tasks.pdf WorkerSpec.pdf EventCounter.pdf PortAllocator.pdf
