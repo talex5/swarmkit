@@ -137,6 +137,11 @@ var _ = Describe("ipam.Allocator", func() {
 		reg      *mockDrvRegistry
 		a        Allocator
 		restorer *addressRestorerMockIpam
+
+		initNetworks    []*api.Network
+		initEndpoints   []*api.Endpoint
+		initAttachments []*api.NetworkAttachment
+		restoreErr      error
 	)
 	BeforeEach(func() {
 		reg = &mockDrvRegistry{
@@ -162,22 +167,33 @@ var _ = Describe("ipam.Allocator", func() {
 			},
 		}
 		a = NewAllocator(reg)
+
+		// Before each test, nil-out the init slices, so we don't
+		// accidentally carry over data from a previous test
+		initNetworks = nil
+		initEndpoints = nil
+		initAttachments = nil
 	})
+
+	JustBeforeEach(func() {
+		restoreErr = a.Restore(initNetworks, initEndpoints, initAttachments)
+	})
+
 	Describe("Restoring pre-existing allocations", func() {
+		var (
+			// was the ipam init called?
+			wasCalled bool
+		)
+		BeforeEach(func() {
+			wasCalled = false
+			reg.beforeIpam = func() { wasCalled = true }
+		})
 		Context("When nothing is allocated", func() {
 			var (
-				err       error
 				wasCalled bool
 			)
-			BeforeEach(func() {
-				wasCalled = false
-				reg.beforeIpam = func() {
-					wasCalled = true
-				}
-				err = a.Restore(nil, nil, nil)
-			})
 			It("should succeed", func() {
-				Expect(err).ToNot(HaveOccurred())
+				Expect(restoreErr).ToNot(HaveOccurred())
 			})
 			It("should not try to get an IPAM driver", func() {
 				Expect(wasCalled).To(BeFalse())
@@ -185,14 +201,11 @@ var _ = Describe("ipam.Allocator", func() {
 		})
 		Context("When passed unallocated objects", func() {
 			var (
-				err                    error
-				wasCalled              bool
 				network, netCopy       *api.Network
 				endpoint, endCopy      *api.Endpoint
 				attachment, attachCopy *api.NetworkAttachment
 			)
 			BeforeEach(func() {
-				reg.beforeIpam = func() { wasCalled = true }
 				network = &api.Network{
 					ID: "net1",
 					DriverState: &api.Driver{
@@ -224,15 +237,19 @@ var _ = Describe("ipam.Allocator", func() {
 					VirtualIPs: []*api.Endpoint_VirtualIP{},
 				}
 				attachment = &api.NetworkAttachment{}
+
 				netCopy = network.Copy()
 				endCopy = endpoint.Copy()
 				attachCopy = attachment.Copy()
-				err = a.Restore([]*api.Network{netCopy}, []*api.Endpoint{endCopy}, []*api.NetworkAttachment{attachCopy})
+
+				initNetworks = append(initNetworks, netCopy)
+				initEndpoints = append(initEndpoints, endCopy)
+				initAttachments = append(initAttachments, attachCopy)
 			})
 			It("should succeed", func() {
-				Expect(err).ToNot(HaveOccurred())
+				Expect(restoreErr).ToNot(HaveOccurred())
 			})
-			It("should not not get an IPAM driver", func() {
+			It("should not get an IPAM driver", func() {
 				Expect(wasCalled).To(BeFalse())
 			})
 			It("should not modify the objects", func() {
@@ -242,9 +259,6 @@ var _ = Describe("ipam.Allocator", func() {
 			})
 		})
 		Context("when a specified ipam driver is invalid", func() {
-			var (
-				err error
-			)
 			BeforeEach(func() {
 				network := &api.Network{
 					ID: "net1",
@@ -266,12 +280,11 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					},
 				}
-
-				err = a.Restore([]*api.Network{network}, nil, nil)
+				initNetworks = append(initNetworks, network)
 			})
 			It("should return ErrBadState", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(WithTransform(errors.IsErrBadState, BeTrue()))
+				Expect(restoreErr).To(HaveOccurred())
+				Expect(restoreErr).To(WithTransform(errors.IsErrBadState, BeTrue()))
 				// TODO(dperny): Expect(err.Error()).To(Equal("ipam driver doesnotexist for network net1 is not valid"))
 			})
 		})
@@ -279,9 +292,6 @@ var _ = Describe("ipam.Allocator", func() {
 			// this case is unlikely but we test it in the interest of
 			// completeness. i can basically only see it happening if a remote
 			// ipam driver failed
-			var (
-				err error
-			)
 			BeforeEach(func() {
 				network := &api.Network{
 					ID: "net2",
@@ -303,18 +313,15 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					},
 				}
-				err = a.Restore([]*api.Network{network}, nil, nil)
+				initNetworks = append(initNetworks, network)
 			})
 			It("should return ErrInternal", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(WithTransform(errors.IsErrInternal, BeTrue()))
+				Expect(restoreErr).To(HaveOccurred())
+				Expect(restoreErr).To(WithTransform(errors.IsErrInternal, BeTrue()))
 				// TODO(dperny): Expect(err.Error()).To(Equal("ipam error from driver addressSpaceFails on network net2: failed"))
 			})
 		})
 		Context("when objects are fully allocated", func() {
-			var (
-				err error
-			)
 			BeforeEach(func() {
 				network1 := &api.Network{
 					ID: "testID1",
@@ -406,14 +413,13 @@ var _ = Describe("ipam.Allocator", func() {
 					Network:   network2,
 					Addresses: []string{"192.168.2.3"},
 				}
-				err = a.Restore(
-					[]*api.Network{network1, network2},
-					[]*api.Endpoint{endpoint1, endpoint2},
-					[]*api.NetworkAttachment{attachment1, attachment2, attachment3},
-				)
+
+				initNetworks = append(initNetworks, network1, network2)
+				initEndpoints = append(initEndpoints, endpoint1, endpoint2)
+				initAttachments = append(initAttachments, attachment1, attachment2, attachment3)
 			})
 			It("should succeed", func() {
-				Expect(err).ToNot(HaveOccurred())
+				Expect(restoreErr).ToNot(HaveOccurred())
 			})
 			It("should have requested 2 pools", func() {
 				Expect(restorer.pools).To(HaveLen(2))
@@ -442,11 +448,18 @@ var _ = Describe("ipam.Allocator", func() {
 		})
 	})
 	Describe("allocating new networks", func() {
+		var (
+			network *api.Network
+			err     error
+		)
+		BeforeEach(func() {
+			network = nil
+		})
+		JustBeforeEach(func() {
+			err = a.AllocateNetwork(network)
+		})
+
 		Context("when the network is already allocated", func() {
-			var (
-				network *api.Network
-				err     error
-			)
 			BeforeEach(func() {
 				network = &api.Network{
 					ID: "testID1",
@@ -479,8 +492,7 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					},
 				}
-				a.Restore([]*api.Network{network}, nil, nil)
-				err = a.AllocateNetwork(network)
+				initNetworks = append(initNetworks, network)
 			})
 			It("should return ErrAlreadyAllocated", func() {
 				Expect(err).To(HaveOccurred())
@@ -515,15 +527,7 @@ var _ = Describe("ipam.Allocator", func() {
 				}
 				reg.ipams["default"] = ipamAndCaps{mock, nil}
 			})
-			AfterEach(func() {
-				// we need to remove the mock IPAM driver we just created
-				delete(reg.ipams, "default")
-			})
 			Context("when the user has specified no settings", func() {
-				var (
-					network *api.Network
-					err     error
-				)
 				BeforeEach(func() {
 					network = &api.Network{
 						ID: "net1",
@@ -533,7 +537,6 @@ var _ = Describe("ipam.Allocator", func() {
 							},
 						},
 					}
-					err = a.AllocateNetwork(network)
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -561,10 +564,6 @@ var _ = Describe("ipam.Allocator", func() {
 				})
 			})
 			Context("when the IPAM driver returns no gateway address", func() {
-				var (
-					network *api.Network
-					err     error
-				)
 				BeforeEach(func() {
 					mock.requestPoolFunc = func(_, _, _ string, _ map[string]string, _ bool) (string, *net.IPNet, map[string]string, error) {
 						return "pool2",
@@ -575,7 +574,6 @@ var _ = Describe("ipam.Allocator", func() {
 					network = &api.Network{
 						ID: "net1",
 					}
-					err = a.AllocateNetwork(network)
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -592,8 +590,6 @@ var _ = Describe("ipam.Allocator", func() {
 			Context("when a gateway address is specified by the user", func() {
 				var (
 					addressRequested string
-					network          *api.Network
-					err              error
 				)
 				BeforeEach(func() {
 					addressRequested = ""
@@ -614,7 +610,6 @@ var _ = Describe("ipam.Allocator", func() {
 							},
 						},
 					}
-					err = a.AllocateNetwork(network)
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -630,9 +625,9 @@ var _ = Describe("ipam.Allocator", func() {
 			})
 			Context("when specifying an IPAM driver", func() {
 				var (
-					network, nwCopy *api.Network
-					err             error
-					wasCalled       bool
+					nwCopy    *api.Network
+					err       error
+					wasCalled bool
 				)
 				BeforeEach(func() {
 					wasCalled = false
@@ -662,7 +657,6 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					nwCopy = network.Copy()
-					err = a.AllocateNetwork(network)
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -679,8 +673,6 @@ var _ = Describe("ipam.Allocator", func() {
 			})
 			Context("when specifying IPAM driver options", func() {
 				var (
-					network           *api.Network
-					err               error
 					options           map[string]string
 					calledWithOptions map[string]string
 				)
@@ -707,7 +699,6 @@ var _ = Describe("ipam.Allocator", func() {
 							},
 							nil
 					}
-					err = a.AllocateNetwork(network)
 				})
 				It("should succeed", func() {
 					Expect(err).ToNot(HaveOccurred())
@@ -725,8 +716,7 @@ var _ = Describe("ipam.Allocator", func() {
 		Describe("a failed request", func() {
 			Context("when passing an invalid ipam", func() {
 				var (
-					network, nwCopy *api.Network
-					err             error
+					nwCopy *api.Network
 				)
 				BeforeEach(func() {
 					network = &api.Network{
@@ -740,7 +730,6 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					nwCopy = network.Copy()
-					err = a.AllocateNetwork(network)
 				})
 				It("should fail with ErrInvalidSpec", func() {
 					Expect(err).To(HaveOccurred())
@@ -754,11 +743,8 @@ var _ = Describe("ipam.Allocator", func() {
 			Context("when the IPAM driver fails to return an address space", func() {
 				// again, testing this is just... pretty dumb, i don't know why
 				// this function is ALLOWED to fail...
-				var (
-					err error
-				)
 				BeforeEach(func() {
-					net := &api.Network{
+					network = &api.Network{
 						ID: "net2",
 						Spec: api.NetworkSpec{
 							IPAM: &api.IPAMOptions{
@@ -768,7 +754,6 @@ var _ = Describe("ipam.Allocator", func() {
 							},
 						},
 					}
-					err = a.AllocateNetwork(net)
 				})
 				It("should return ErrInternal", func() {
 					Expect(err).To(HaveOccurred())
@@ -779,7 +764,6 @@ var _ = Describe("ipam.Allocator", func() {
 			Context("when the pool request fails", func() {
 				var (
 					wasCalled bool
-					err       error
 				)
 				BeforeEach(func() {
 					wasCalled = false
@@ -790,7 +774,7 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					reg.ipams["poolfails"] = ipamAndCaps{mock, nil}
-					err = a.AllocateNetwork(&api.Network{
+					network = &api.Network{
 						ID: "net1",
 						Spec: api.NetworkSpec{
 							IPAM: &api.IPAMOptions{
@@ -799,10 +783,7 @@ var _ = Describe("ipam.Allocator", func() {
 								},
 							},
 						},
-					})
-				})
-				AfterEach(func() {
-					delete(reg.ipams, "poolfails")
+					}
 				})
 				It("should fail with ErrInternal", func() {
 					Expect(wasCalled).To(BeTrue())
@@ -815,7 +796,6 @@ var _ = Describe("ipam.Allocator", func() {
 				// why is this even possible tho i don't even understand why we
 				// need to check this
 				var (
-					err            error
 					poolsRequested int
 				)
 				BeforeEach(func() {
@@ -832,7 +812,7 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					reg.ipams["default"] = ipamAndCaps{mock, nil}
-					network := &api.Network{
+					network = &api.Network{
 						ID: "net1",
 						Spec: api.NetworkSpec{
 							Annotations: api.Annotations{
@@ -840,10 +820,6 @@ var _ = Describe("ipam.Allocator", func() {
 							},
 						},
 					}
-					err = a.AllocateNetwork(network)
-				})
-				AfterEach(func() {
-					delete(reg.ipams, "default")
 				})
 				It("should return ErrInternal", func() {
 					Expect(err).To(HaveOccurred())
@@ -852,9 +828,6 @@ var _ = Describe("ipam.Allocator", func() {
 				})
 			})
 			Context("when requesting a gateway address fails", func() {
-				var (
-					err error
-				)
 				BeforeEach(func() {
 					mock := &mockIpam{
 						requestPoolFunc: func(_, _, _ string, _ map[string]string, _ bool) (string, *net.IPNet, map[string]string, error) {
@@ -870,7 +843,7 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					reg.ipams["default"] = ipamAndCaps{mock, nil}
-					err = a.AllocateNetwork(&api.Network{
+					network = &api.Network{
 						ID: "id1",
 						Spec: api.NetworkSpec{
 							IPAM: &api.IPAMOptions{
@@ -881,10 +854,7 @@ var _ = Describe("ipam.Allocator", func() {
 								},
 							},
 						},
-					})
-				})
-				AfterEach(func() {
-					delete(reg.ipams, "default")
+					}
 				})
 				It("should return ErrInternal", func() {
 					Expect(err).To(HaveOccurred())
@@ -895,9 +865,8 @@ var _ = Describe("ipam.Allocator", func() {
 			Context("when multiple configs are specified, and a later one fails", func() {
 				var (
 					mock                             *mockIpam
-					network, nwCopy                  *api.Network
+					nwCopy                           *api.Network
 					poolsReleased, addressesReleased int
-					err                              error
 				)
 				BeforeEach(func() {
 					poolsReleased = 0
@@ -947,11 +916,6 @@ var _ = Describe("ipam.Allocator", func() {
 						},
 					}
 					nwCopy = network.Copy()
-				})
-				// using JustBeforeEach here so we can check the sub-cases of
-				// double faults
-				JustBeforeEach(func() {
-					err = a.AllocateNetwork(network)
 				})
 				It("should fail with ErrInternal", func() {
 					Expect(err).To(HaveOccurred())
@@ -1226,6 +1190,7 @@ var _ = Describe("ipam.Allocator", func() {
 				})
 				PContext("when allocation fails partway through", func() {
 					It("should return an error", func() {
+
 					})
 					It("should roll back any successful new allocations", func() {
 					})
