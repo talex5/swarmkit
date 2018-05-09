@@ -151,7 +151,7 @@ func (a *NewAllocator) run(ctx context.Context) error {
 	// defer canceling the context, so that anything waiting on it will exit
 	// when this routine exits.
 	defer c()
-	ctx = log.WithModule(ctx, "allocator")
+	ctx = log.WithModule(ctx, "newallocator")
 	ctx = log.WithField(ctx, "method", "(*NewAllocator).Run")
 	log.G(ctx).Info("starting network allocator")
 
