@@ -1410,7 +1410,10 @@ func watchNode(t *testing.T, watch chan events.Event, expectTimeout bool,
 		case event := <-watch:
 			if n, ok := event.(api.EventUpdateNode); ok {
 				node = n.Node.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, originalNode, node, networks)) {
+				if fn == nil {
+					return
+				}
+				if fn(mockTester{}, originalNode, node, networks) {
 					return
 				}
 			}

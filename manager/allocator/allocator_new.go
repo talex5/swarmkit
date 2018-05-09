@@ -44,7 +44,7 @@ func init() {
 	storeLockHeld = ns.NewLabeledTimer(
 		"store_lock_held",
 		"The number of seconds the allocator holds open store transactions",
-		"object", "action",
+		"object", "action", "lock_type",
 	)
 
 	batchProcessingDuration = ns.NewTimer(
@@ -70,6 +70,8 @@ type NewAllocator struct {
 	stopped  chan struct{}
 	stopOnce sync.Once
 
+	// pending objects are those which have not yet passed through the
+	// allocator.
 	pendingMu       sync.Mutex
 	pendingNetworks map[string]struct{}
 	pendingTasks    map[string]struct{}
@@ -289,8 +291,11 @@ func (a *NewAllocator) run(ctx context.Context) error {
 							// TODO(dperny): doing a store update in this event
 							// loop is probably pretty much the worst thing I
 							// can imagine doing for performance.
+							log.G(ctx).WithField("network.id", ev.Network.ID).Debug(
+								"an overlay network was removed, deallocating it from nodes",
+							)
 							a.store.Update(func(tx store.Tx) error {
-								storeDone := metrics.StartTimer(storeLockHeld.WithValues("network", "deallocate"))
+								storeDone := metrics.StartTimer(storeLockHeld.WithValues("network", "deallocate", "write"))
 								defer storeDone()
 
 								nodes, err := store.FindNodes(tx, store.All)
@@ -418,9 +423,13 @@ func (a *NewAllocator) run(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-batchTimer.C:
-				// TODO(dperny): probably not safe to check len without a lock
-				// but whatever.
-				if len(a.pendingNetworks)+len(a.pendingNodes)+len(a.pendingTasks) > 0 {
+				a.pendingMu.Lock()
+				total := len(a.pendingNetworks) + len(a.pendingNodes) + len(a.pendingTasks)
+				a.pendingMu.Unlock()
+				// we release the lock before checking the total, which is fine
+				// because the worst case is something gets deleted and the
+				// processPendingAllocations just jumps straight through
+				if total > 0 {
 					// every batch interval, do all allocations and then reset the
 					// timer to ready for the next batch
 					a.processPendingAllocations(ctx)
@@ -457,183 +466,450 @@ func (a *NewAllocator) processPendingAllocations(ctx context.Context) {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 
-	// collect metrics on how long each batch takes. start at timer after we
-	// acquire the lock, and then defer the done call
+	log.G(ctx).Debugf(
+		"processing pending allocations. %v networks, %v nodes, %v tasks",
+		len(a.pendingNetworks), len(a.pendingNodes), len(a.pendingTasks),
+	)
+
+	defer func() {
+		log.G(ctx).Debugf(
+			"finished processing pending allocations. retrying: %v networks, %v nodes, %v tasks",
+			len(a.pendingNetworks), len(a.pendingNodes), len(a.pendingTasks),
+		)
+	}()
+
+	// collect metrics on how long each batch of pending allocations takes.
+	// start at timer after we acquire the lock, and then defer the done call.
 	done := metrics.StartTimer(batchProcessingDuration)
 	defer done()
 
-	if err := a.store.Batch(func(batch *store.Batch) error {
-		if len(a.pendingNetworks) > 0 {
-			log.G(ctx).Debugf("allocating %v networks", len(a.pendingNetworks))
-		}
-		for nwid := range a.pendingNetworks {
-			ctx := log.WithField(ctx, "network.id", nwid)
-			// don't actually return any errors from this function unless we
-			// want to abort the batch
-			if err := batch.Update(func(tx store.Tx) error {
-				// keep a timer of how long network allocation transactions
-				// take
-				batchDone := metrics.StartTimer(storeLockHeld.WithValues("network", "allocate"))
-				defer batchDone()
+	// overlayAllocated is a variable that tracks whether a new overlay network
+	// has been allocated. If it is true, then regardless of which nodes are
+	// currently pending, all nodes will need to be reallocated with the new
+	// network. we will do this after network allocation, but before task
+	// allocation, to avoid a case where
+	overlayAllocated := false
 
-				// get the most up-to-date information about the network
-				network := store.GetNetwork(tx, nwid)
-				// if we get back nil, the network may have been deleted, and
-				// there's nothing to do
-				if network == nil {
-					log.G(ctx).Debug("network not found, probably deleted")
-					return nil
+	// capture the pending maps and reinitialize them, so they'll be clean
+	// after this runs
+	pendingNetworks := a.pendingNetworks
+	a.pendingNetworks = map[string]struct{}{}
+	pendingNodes := a.pendingNodes
+	a.pendingNodes = map[string]struct{}{}
+	pendingTasks := a.pendingTasks
+	a.pendingTasks = map[string]struct{}{}
+	// first, pending networks. open the store and grab all of the pending
+	// networks. networks can't be updated, so we don't need to worry about a
+	// race condition.
+
+	// if no networks are pending, skip this block. this saves us the time it
+	// takes to acquire the store lock
+	if len(pendingNetworks) > 0 {
+		// we'll need two slices. the first is to hold all of the networks we get
+		// from the store. the second holds all of the successfully allocated
+		// networks
+		networks := make([]*api.Network, 0, len(pendingNetworks))
+		allocatedNetworks := make([]*api.Network, 0, len(pendingNetworks))
+
+		batchDone := metrics.StartTimer(storeLockHeld.WithValues("networks", "allocate", "read"))
+		a.store.View(func(tx store.ReadTx) {
+			for id := range pendingNetworks {
+				// remove the network from the pending allocations. if something
+				// fails and we need to retry, we'll add it back.
+				nw := store.GetNetwork(tx, id)
+				if nw == nil {
+					log.G(ctx).WithField("network.id", id).Debug("network not found, probably deleted")
+					continue
 				}
-				// metrics on how long it takes to allocate a network
-				allocDone := metrics.StartTimer(allocatorActions.WithValues("network", "allocate"))
-				err := a.network.AllocateNetwork(network)
-				allocDone()
-				if err != nil {
-					if errors.IsErrAlreadyAllocated(err) {
-						log.G(ctx).Debug("network already allocated")
-						delete(a.pendingNetworks, nwid)
+				networks = append(networks, nw)
+			}
+		})
+		batchDone()
+
+		// now, allocate each network
+		for _, network := range networks {
+			ctx := log.WithField(ctx, "network.id", network.ID)
+			allocDone := metrics.StartTimer(allocatorActions.WithValues("network", "allocate"))
+			err := a.network.AllocateNetwork(network)
+			allocDone()
+
+			// error conditions from the allocator are numerous, but are
+			// constrained to a few specific types, which we can completely cover.
+			switch {
+			case err == nil:
+				// first, if no error occurred, then we can add this to the list of
+				// networks we will commit
+				allocatedNetworks = append(allocatedNetworks, network)
+			case errors.IsErrAlreadyAllocated(err):
+				// if the network is already allocated, there is nothing to do. log
+				// that and do not add this network to the batch
+				log.G(ctx).Debug("network already fully allocated")
+			case errors.IsErrRetryable(err):
+				// if the error is retryable, then we should log that error and
+				// re-add this network to our pending networks
+				log.G(ctx).WithError(err).Error("network could not be allocated, but will be retried")
+				a.pendingNetworks[network.ID] = struct{}{}
+			default:
+				// default covers any other error case. specifically, error that
+				// are not retryable. for these, we should fail and not re-add them
+				// to the pending map. they will never succeed
+				log.G(ctx).WithError(err).Error("network cannot be allocated")
+			}
+		}
+
+		// again, if we haven't actually successfully allocated any networks,
+		// we should skip this part to avoid holding the lock
+		if len(allocatedNetworks) > 0 {
+			batchDone = metrics.StartTimer(storeLockHeld.WithValues("network", "allocate", "write"))
+			// now, batch update the networks we just allocated
+			if err := a.store.Batch(func(batch *store.Batch) error {
+				for _, network := range allocatedNetworks {
+					if err := batch.Update(func(tx store.Tx) error {
+						ctx := log.WithField(ctx, "network.id", network.ID)
+						// first, get the network and make sure it still exists
+						currentNetwork := store.GetNetwork(tx, network.ID)
+						if currentNetwork == nil {
+							log.G(ctx).WithField("network.id", network.ID).Debugf("network was deleted after allocation but before commit")
+							// if the current network is nil, then the network was
+							// deleted and we should deallocate it.
+							a.network.DeallocateNetwork(network)
+						}
+						if err := store.UpdateNetwork(tx, network); err != nil {
+							return err
+						}
+						// if the network is successfully updated, check if
+						// it's an overlay network. if so, set the
+						// overlayAllocated flag so we reallocate nodes
+						if network.DriverState != nil && network.DriverState.Name == "overlay" {
+							log.G(ctx).Info("an overlay network was allocated, reallocating nodes")
+							overlayAllocated = true
+						}
 						return nil
-					}
-					log.G(ctx).WithError(err).Error("network allocation failed")
-					// if the error isn't a retryable error, we're going to
-					// delete this from the pending allocations, because it
-					// will never succeed
-					if !errors.IsErrRetryable(err) {
-						log.G(ctx).Error("network allocation error is fatal and this network will never succeed")
-						delete(a.pendingNetworks, nwid)
-					}
-				}
-				// log.G(ctx).Debug("network allocation succeeded")
-				if err := store.UpdateNetwork(tx, network); err != nil {
-					// TODO(dperny) better error handling here?
-					return err
-				}
-				// if this is an overlay network, reallocate all of the nodes
-				// (to attach them to this overlay)
-				if network.DriverState != nil && network.DriverState.Name == "overlay" {
-					log.G(ctx).Debug("added an overlay network, reallocating all nodes")
-					nodes, err := store.FindNodes(tx, store.All)
-					if err != nil {
-						// TODO(dperny): again, can we handle errors better?
-						return err
-					}
-					for _, node := range nodes {
-						a.pendingNodes[node.ID] = struct{}{}
+					}); err != nil {
+						log.G(ctx).WithError(err).Error("error writing network to store")
 					}
 				}
 				return nil
 			}); err != nil {
-				log.G(ctx).WithError(err).Error("batch update of network allocation failed")
+				log.G(ctx).WithError(err).Error("error committing allocated networks")
 			}
+			batchDone()
 		}
-		log.G(ctx).Debug("finished allocating networks")
+	}
 
-		if len(a.pendingTasks) > 0 {
-			log.G(ctx).Debugf("allocating %v tasks", len(a.pendingTasks))
-		}
-		for taskid := range a.pendingTasks {
-			ctx := log.WithField(ctx, "task.id", taskid)
-			if err := batch.Update(func(tx store.Tx) error {
-				batchDone := metrics.StartTimer(storeLockHeld.WithValues("task", "allocate"))
-				defer batchDone()
+	// next, allocate pending nodes, if there are any, or if an overlay network
+	// has been allocated
+	if overlayAllocated || len(pendingNodes) > 0 {
+		// nodes is the set of node objects we'll allocate
+		var nodes []*api.Node
 
-				err := a.allocateTask(tx, taskid)
-				if err != nil && !errors.IsErrAlreadyAllocated(err) {
-					log.G(ctx).WithError(err).Error("task allocation failed")
-				}
-				// if the error is not a retriable error (or not an error at
-				// all), or it is ErrAlreadyAllocated, then delete from pending
-				// tasks.
-				if !errors.IsErrRetryable(err) || errors.IsErrAlreadyAllocated(err) {
-					delete(a.pendingTasks, taskid)
-				}
-				return nil
-			}); err != nil {
-				log.G(ctx).WithError(err).Error("error in batch update")
-			}
-		}
-		log.G(ctx).Debug("finished allocating tasks")
+		// networks is a set of all overlay networks currently in use
+		overlayNetworks := map[string]struct{}{}
 
-		if len(a.pendingNodes) > 0 {
-			log.G(ctx).Debugf("allocating %v nodes", len(a.pendingNodes))
-		}
-		// TODO(dperny): this is a really sloppy way of logging this once.
-		var logged bool
-		for nodeid := range a.pendingNodes {
-			ctx := log.WithField(ctx, "node.id", nodeid)
-			if err := batch.Update(func(tx store.Tx) error {
-				batchDone := metrics.StartTimer(storeLockHeld.WithValues("node", "allocate"))
-				defer batchDone()
-				networks, err := store.FindNetworks(tx, store.All)
+		readTxDone := metrics.StartTimer(storeLockHeld.WithValues("node", "allocate", "read"))
+		a.store.View(func(tx store.ReadTx) {
+			if overlayAllocated {
+				var err error
+				nodes, err = store.FindNodes(tx, store.All)
 				if err != nil {
-					// TODO(dperny): better error handling
-					return err
+					// i don't know what to do here
 				}
-				nwids := map[string]struct{}{}
-				// add all overlay networks to the node
-				for _, network := range networks {
-					// using the driver state instead of the spec here means
-					// we'll only request attachments for fully-allocated
-					// networks
-					if network.DriverState != nil && network.DriverState.Name == "overlay" {
-						nwids[network.ID] = struct{}{}
+			} else {
+				nodes = make([]*api.Node, 0, len(pendingNodes))
+				for id := range pendingNodes {
+					node := store.GetNode(tx, id)
+					if node == nil {
+						log.G(ctx).WithField("node.id", id).Debug("pending node not in store, probably deleted")
+						continue
 					}
+					nodes = append(nodes, node)
 				}
+			}
 
-				if !logged {
-					log.G(ctx).Debugf("allocating %v networks for nodes", len(nwids))
-					logged = true
+			// now, get all overlay network IDs that are in use, so we can
+			// allocate them to the nodes
+			networks, err := store.FindNetworks(tx, store.All)
+			if err != nil {
+				// TODO(dperny): we can't actually proceed if there is an error,
+				// because then we might deallocate all nodes' attachments
+			}
+			for _, network := range networks {
+				if network.DriverState != nil && network.DriverState.Name == "overlay" {
+					overlayNetworks[network.ID] = struct{}{}
 				}
+			}
+		})
+		readTxDone()
 
-				node := store.GetNode(tx, nodeid)
-				// TODO(dperny): this block is part of docker/swarmkit#2621 and
-				// should be uncommented when this code is rebased and includes
-				// the test changes from that
-				// we only allocate all overlay networks for windows nodes. if
-				// a node is not a windows node, set the nwids map to "nil",
-				// which will cause the allocator to only allocate the ingress
-				// network.
-				// if node.Description == nil || node.Description.Platform == nil || node.Description.Platform.OS != "windows" {
-				//     nwids = nil
-				// }
-				allocDone := metrics.StartTimer(allocatorActions.WithValues("node", "allocate"))
-				err = a.network.AllocateNode(node, nwids)
-				allocDone()
-				// there are a lot of if statements, but this is mostly complex
-				// just to make logging behave a certain way
+		// make space for the successfully allocated nodes
+		allocatedNodes := make([]*api.Node, 0, len(nodes))
 
-				// first, if there is an error that isn't ErrAlreadyAllocated,
-				// then we log that; those errors are important
-				if err != nil && !errors.IsErrAlreadyAllocated(err) {
-					log.G(ctx).WithError(err).Error("error allocating node")
-				}
-				// next, if the error isn't retryable (which includes both no
-				// error and ErrAlreadyAllocated), then we should remove the
-				// node from the map so as not to try allocating it next batch
-				if !errors.IsErrRetryable(err) {
-					delete(a.pendingNodes, nodeid)
-				}
-				// next, if this is ErrAlreadyAllocated, log it at a debug
-				// level. it's a mildly noteworthy event if we try to allocate
-				// a node that is already fully allocated.
-				if errors.IsErrAlreadyAllocated(err) {
-					log.G(ctx).Debug("node is already fully allocated")
-				}
-				// finally, if there was no error at all, then we should update
-				// the node object in the store.
-				if err == nil {
-					return store.UpdateNode(tx, node)
+		for _, node := range nodes {
+			ctx := log.WithField(ctx, "node.id", node.ID)
+			allocDone := metrics.StartTimer(allocatorActions.WithValues("node", "allocate"))
+			err := a.network.AllocateNode(node, overlayNetworks)
+			allocDone()
+
+			switch {
+			case err == nil:
+				// first, if no error occurred, then we can add this to the list of
+				// networks we will commit
+				allocatedNodes = append(allocatedNodes, node)
+			case errors.IsErrAlreadyAllocated(err):
+				// if the network is already allocated, there is nothing to do. log
+				// that and do not add this network to the batch
+				log.G(ctx).Debug("node already fully allocated")
+			case errors.IsErrRetryable(err):
+				// if the error is retryable, then we should log that error and
+				// re-add this network to our pending networks
+				log.G(ctx).WithError(err).Error("node could not be allocated, but will be retried")
+				a.pendingNodes[node.ID] = struct{}{}
+			default:
+				// default covers any other error case. specifically, error that
+				// are not retryable. for these, we should fail and not re-add them
+				// to the pending map. they will never succeed
+				log.G(ctx).WithError(err).Error("node cannot be allocated")
+			}
+		}
+
+		// if any nodes successfully allocated, commit them
+		if len(allocatedNodes) > 0 {
+			if err := a.store.Batch(func(batch *store.Batch) error {
+				for _, node := range allocatedNodes {
+					writeTxDone := metrics.StartTimer(storeLockHeld.WithValues("node", "allocate", "write"))
+					if err := batch.Update(func(tx store.Tx) error {
+						currentNode := store.GetNode(tx, node.ID)
+						if currentNode == nil {
+							// if there is no node, then it must have been
+							// deleted. deallocate our changes.
+
+							// TODO(dperny): IMPORTANT! there is a race
+							// condition here which is very dangerous! calls to
+							// deallocate are not idempotent! this means that
+							// we can't be sure that we won't inadvertently
+							// free some state when we deallocate a second
+							// time! a classic double-free case!
+							log.G(ctx).WithField("node.id", node.ID).Debug("node was deleted after allocation but before committing")
+							a.network.DeallocateNode(node)
+							return nil
+						}
+
+						// the node may have changed in the meantime since we
+						// read it before allocation. but since we're the only
+						// one who changes the attachments, we can just plop
+						// our new attachments into that slice with no danger
+						currentNode.Attachments = node.Attachments
+
+						return store.UpdateNode(tx, currentNode)
+					}); err != nil {
+						log.G(ctx).WithError(err).WithField("node.id", node.ID).Error("error in committing allocated node")
+					}
+					writeTxDone()
 				}
 				return nil
 			}); err != nil {
-				log.G(ctx).WithError(err).Error("error in batch update")
+				log.G(ctx).WithError(err).Error("error in batch update of allocated nodes")
 			}
 		}
-		log.G(ctx).Debug("finished allocating nodes")
-		log.G(ctx).Debug("finished all allocations")
-		return nil
-	}); err != nil {
-		log.G(ctx).WithError(err).Error("error processing pending allocations batch")
+	}
+
+	// finally, allocate all tasks.
+	if len(pendingTasks) > 0 {
+		// this might seem a bit nonobvious. basically, what we're doing is
+		// allocating services as needed by tasks. and we're going to optimize
+		// on allocating many tasks belonging to a service at the same time.
+		// So, in our View transaction, we're going to go through each pending
+		// task ID. if it's still ready for allocation, we're going to get its
+		// service and stash the service in a slice. then, we're going to stash
+		// the task in a slice in a map.
+
+		// services is a slice of services with tasks pending allocation
+		services := []*api.Service{}
+
+		// tasks is a map from service id to a slice of task objects belonging
+		// to that service
+		tasks := map[string][]*api.Task{}
+		storeDone := metrics.StartTimer(storeLockHeld.WithValues("service", "allocate", "read"))
+		a.store.View(func(tx store.ReadTx) {
+			for taskid := range pendingTasks {
+				t := store.GetTask(tx, taskid)
+				// if the task is not nil, is in state NEW, and is desired to
+				// be running, then it still needs allocation
+				if t != nil && t.Status.State == api.TaskStateNew && t.DesiredState == api.TaskStateRunning {
+					// if the task has an empty service, then we don't need to
+					// allocate the service. however, we'll keep those
+					// serviceless tasks (network attachment tasks) under the
+					// emptystring key in the map and specialcase that key
+					// later.
+					service := store.GetService(tx, t.ServiceID)
+					if service != nil {
+						services = append(services, service)
+					}
+					// thus, if t.ServiceID == "", this will still work
+					// this is safe without initializing each slice, because
+					// appending to a nil slice is valid
+					tasks[t.ServiceID] = append(tasks[t.ServiceID], t)
+				}
+			}
+		})
+		storeDone()
+
+		// allocatedServices will store the services we have actually
+		// allocated, not including the services that didn't need allocation
+		allocatedServices := make([]*api.Service, 0, len(services))
+		// allocatedTasks, likewise, stores the tasks we've successfully
+		// allocated and should commit. we don't initialize it with a fixed
+		// length because it's trickier for tasks
+		allocatedTasks := []*api.Task{}
+
+		// now, allocate the services and all of their tasks
+		for _, service := range services {
+			ctx := log.WithField(ctx, "service.id", service.ID)
+			allocDone := metrics.StartTimer(allocatorActions.WithValues("service", "allocate"))
+			err := a.network.AllocateService(service)
+			allocDone()
+			switch {
+			case err == nil:
+				// first, if no error occurred, then we can add this to the list of
+				// networks we will commit
+				allocatedServices = append(allocatedServices, service)
+			case errors.IsErrAlreadyAllocated(err):
+				// if the network is already allocated, there is nothing to do. log
+				// that and do not add this network to the batch
+				log.G(ctx).Debug("service already fully allocated")
+			case errors.IsErrRetryable(err):
+				// if the error is retryable, then we should log that error,
+				// and then re-add every pending task belonging to this service
+				// to our pending tasks, and remove their entry from the tasks
+				// map.
+				log.G(ctx).WithError(err).Error("service could not be allocated, but will be retried")
+				for _, task := range tasks[service.ID] {
+					a.pendingTasks[task.ID] = struct{}{}
+				}
+				delete(tasks, service.ID)
+			default:
+				// default covers any other error case. specifically, error that
+				// are not retryable. for these, we should fail and not re-add them
+				// to the pending map. they will never succeed. additionally,
+				// remove these tasks from the map
+				log.G(ctx).WithError(err).Error("service cannot be allocated")
+				delete(tasks, service.ID)
+			}
+
+			// now, we should allocate all of the tasks for this service
+			for _, task := range tasks[service.ID] {
+				ctx := log.WithField(ctx, "task.id", task.ID)
+				allocTaskDone := metrics.StartTimer(allocatorActions.WithValues("task", "allocate"))
+				err := a.network.AllocateTask(task)
+				allocTaskDone()
+				switch {
+				case err == nil:
+					// first, if no error occurred, then we can add this to the
+					// list of tasks we will commit
+					allocatedTasks = append(allocatedTasks, task)
+				case errors.IsErrAlreadyAllocated(err):
+					// if the task is already allocated, there is nothing to do. log
+					// that and do not add this network to the batch
+					log.G(ctx).Debug("task already fully allocated")
+				case errors.IsErrRetryable(err):
+					// if the error is retryable, then we should log that error
+					// and readd the task to the pending tasks map
+					log.G(ctx).WithError(err).Error("task could not be allocated, but will be retried")
+					a.pendingTasks[task.ID] = struct{}{}
+				default:
+					// default covers any other error case. specifically, error that
+					// are not retryable. for these, we should fail and not re-add them
+					// to the pending map. they will never succeed. additionally,
+					// remove these tasks from the map
+					log.G(ctx).WithError(err).Error("task cannot be allocated")
+				}
+			}
+		}
+
+		// now handle all of the tasks belonging to no service
+		for _, task := range tasks[""] {
+			ctx := log.WithField(ctx, "task.id", task.ID)
+			allocTaskDone := metrics.StartTimer(allocatorActions.WithValues("task", "allocate"))
+			err := a.network.AllocateTask(task)
+			allocTaskDone()
+			switch {
+			case err == nil:
+				// first, if no error occurred, then we can add this to the
+				// list of tasks we will commit
+				allocatedTasks = append(allocatedTasks, task)
+			case errors.IsErrAlreadyAllocated(err):
+				// if the task is already allocated, there is nothing to do. log
+				// that and do not add this network to the batch
+				log.G(ctx).Debug("task already fully allocated")
+			case errors.IsErrRetryable(err):
+				// if the error is retryable, then we should log that error
+				// and readd the task to the pending tasks map
+				log.G(ctx).WithError(err).Error("task could not be allocated, but will be retried")
+				a.pendingTasks[task.ID] = struct{}{}
+			default:
+				// default covers any other error case. specifically, error that
+				// are not retryable. for these, we should fail and not re-add them
+				// to the pending map. they will never succeed. additionally,
+				// remove these tasks from the map
+				log.G(ctx).WithError(err).Error("task cannot be allocated")
+			}
+		}
+
+		// finally, if we have any services or tasks to commit, open a
+		// batch and commit them
+		if len(allocatedServices)+len(allocatedTasks) > 0 {
+			taskWriteTxDone := metrics.StartTimer(storeLockHeld.WithValues("allocate", "task", "write"))
+			if err := a.store.Batch(func(batch *store.Batch) error {
+				for _, service := range allocatedServices {
+					if err := batch.Update(func(tx store.Tx) error {
+						currentService := store.GetService(tx, service.ID)
+						if currentService == nil {
+							// TODO(dperny): see explanation in node
+							log.G(ctx).WithField("service.id", service.ID).Debug("service was delete after allocation but before commit")
+							a.network.DeallocateService(service)
+							return nil
+						}
+						// the service may have changed in the meantime, so
+						// only update the fields we just altered in it.
+						// in this case, only the endpoint
+						currentService.Endpoint = service.Endpoint
+						// then commit the service
+						return store.UpdateService(tx, currentService)
+					}); err != nil {
+						// TODO(dperny)
+					}
+				}
+
+				for _, task := range allocatedTasks {
+					if err := batch.Update(func(tx store.Tx) error {
+						currentTask := store.GetTask(tx, task.ID)
+						if currentTask == nil ||
+							currentTask.Status.State != api.TaskStateNew ||
+							currentTask.DesiredState != api.TaskStateRunning {
+							log.G(ctx).WithField("task.id", task.ID).Debug("task removed after allocation but before commit")
+							a.network.DeallocateTask(task)
+							return nil
+						}
+
+						currentTask.Endpoint = task.Endpoint
+						currentTask.Networks = task.Networks
+						// update the task status as well
+						currentTask.Status = api.TaskStatus{
+							State:     api.TaskStatePending,
+							Message:   AllocatedStatusMessage,
+							Timestamp: ptypes.MustTimestampProto(time.Now()),
+						}
+						return store.UpdateTask(tx, currentTask)
+					}); err != nil {
+						// TODO(dperny)
+					}
+				}
+				return nil
+			}); err != nil {
+				// TODO(dperny)
+			}
+			taskWriteTxDone()
+		}
 	}
 }
 

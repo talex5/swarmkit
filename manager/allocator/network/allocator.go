@@ -205,7 +205,7 @@ func (a *allocator) Restore(networks []*api.Network, services []*api.Service, ta
 	return nil
 }
 
-// Allocate network takes the given network and allocates it to match the
+// AllocateNetwork takes the given network and allocates it to match the
 // provided network spec
 func (a *allocator) AllocateNetwork(n *api.Network) error {
 	// first, figure out if the network is node-local, so we know whether or
@@ -436,14 +436,19 @@ func (a *allocator) AllocateTask(task *api.Task) (rerr error) {
 			return errors.ErrDependencyNotAllocated("network", "ingress")
 		}
 	}
-	// set up a slice to contain all of the attachments we will create
+	// set up a slice to contain all of the attachments we will create. to make
+	// rolling back easier, we'll keep two lists, one for overlay networks and
+	// one for node-local networks
 	finalAttachments := make([]*api.NetworkAttachment, 0, len(attachmentConfigs))
+	localAttachments := []*api.NetworkAttachment{}
 	// and set up a defer to roll back attachments. We may have some
 	// attachments succeed before one fails. If one does fail, we should
 	// deallocate all of the ones that succeeded
 	defer func() {
 		if rerr != nil {
-			a.DeallocateTask(task)
+			for _, attachment := range finalAttachments {
+				a.ipam.DeallocateAttachment(attachment)
+			}
 		}
 	}()
 
@@ -460,17 +465,18 @@ func (a *allocator) AllocateTask(task *api.Task) (rerr error) {
 				Addresses:            config.Addresses,
 				DriverAttachmentOpts: config.DriverAttachmentOpts,
 			}
+			localAttachments = append(localAttachments, attachment)
 		} else {
 			var err error
 			attachment, err = a.ipam.AllocateAttachment(config)
 			if err != nil {
 				return err
 			}
+			finalAttachments = append(finalAttachments, attachment)
 		}
-		finalAttachments = append(finalAttachments, attachment)
 	}
 
-	task.Networks = finalAttachments
+	task.Networks = append(finalAttachments, localAttachments...)
 	return nil
 }
 
@@ -496,7 +502,7 @@ func (a *allocator) DeallocateTask(task *api.Task) error {
 				finalErr = err
 			}
 			// remove the addresses after we've deallocated every attachment
-			attachment.Addresses = nil
+			// attachment.Addresses = nil
 		}
 	}
 	return finalErr
@@ -508,17 +514,16 @@ func (a *allocator) DeallocateTask(task *api.Task) error {
 // are informed by its task allocations, which is a list not available in this
 // context.
 //
-// The passed networks map will be mutated, and should not be reused after
-// passing to this function.
-//
 // If this method returns nil, then the node has been fully allocated, and
 // should be committed. Otherwise, the node will not be altered.
-func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) (rerr error) {
-	// allow the caller to pass a nil map, but make sure that it's not nil when
-	// we want to use it.
-	if networks == nil {
-		networks = map[string]struct{}{}
+func (a *allocator) AllocateNode(node *api.Node, requestedNetworks map[string]struct{}) (rerr error) {
+	networks := map[string]struct{}{}
+
+	// copy the networks map so we can safely mutate it
+	for nw := range requestedNetworks {
+		networks[nw] = struct{}{}
 	}
+
 	// before we do anything, add the ingress network if it exists to the
 	// networks map. we always need an ingress network attachment.
 	if a.ingressID != "" {
@@ -542,6 +547,14 @@ func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) (
 		} else {
 			remove = append(remove, attachment)
 		}
+	}
+
+	// check here if we're fully allocated on this node already. this is the
+	// case if:
+	//   1. We are keeping the same number of attachments
+	//   2. No networks remain in the networks map (every one is already in keep)
+	if len(keep) == len(node.Attachments) && len(networks) == 0 {
+		return errors.ErrAlreadyAllocated()
 	}
 
 	// you may ask, shouldn't we deallocate first, to free up resources? the
@@ -593,8 +606,7 @@ func (a *allocator) AllocateNode(node *api.Node, networks map[string]struct{}) (
 	return nil
 }
 
-// DeallocateNode takes a node and frees its associated network resources. It
-// also removes the Addresses from the node's Attachments.
+// DeallocateNode takes a node and frees its associated network resources.
 //
 // If this method returns no error, and the node is not being deleted, then the
 // node should be committed.
@@ -604,7 +616,6 @@ func (a *allocator) DeallocateNode(node *api.Node) error {
 		if err := a.ipam.DeallocateAttachment(attachment); err != nil {
 			finalErr = err
 		}
-		attachment.Addresses = nil
 	}
 	return finalErr
 }

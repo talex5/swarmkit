@@ -493,7 +493,9 @@ func (a *allocator) DeallocateNetwork(network *api.Network) {
 	}
 	// remove the IPAM config. this may be useful for "rolling back" a network
 	// allocation.
-	network.IPAM = nil
+	// NOTE(dperny): doing this can cause a data race. i believe it may be
+	// possible that the same network object is shared across event receivers.
+	// network.IPAM = nil
 	delete(a.networks, network.ID)
 }
 

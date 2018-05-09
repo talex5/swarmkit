@@ -1121,10 +1121,14 @@ var _ = Describe("ipam.Allocator", func() {
 				It("should add VIPs to the endpoint", func() {
 					Expect(endpoint.VirtualIPs).ToNot(BeNil())
 					Expect(endpoint.VirtualIPs).To(HaveLen(2))
-					Expect(endpoint.VirtualIPs).To(ConsistOf(
-						&api.Endpoint_VirtualIP{NetworkID: "nw1", Addr: "192.168.3.0/24"},
-						&api.Endpoint_VirtualIP{NetworkID: "nw2", Addr: "192.168.3.1/24"},
-					))
+					nwids := []string{}
+					addrs := []string{}
+					for _, vip := range endpoint.VirtualIPs {
+						nwids = append(nwids, vip.NetworkID)
+						addrs = append(addrs, vip.Addr)
+					}
+					Expect(nwids).To(ConsistOf("nw1", "nw2"))
+					Expect(addrs).To(ConsistOf("192.168.3.0/24", "192.168.3.1/24"))
 				})
 				It("should have allocated 2 addresses", func() {
 					Expect(addressesAllocated).To(Equal(2))

@@ -1127,7 +1127,185 @@ var _ = Describe("network.Allocator", func() {
 			})
 		})
 
-		PDescribe("allocating nodes", func() {
+		Describe("allocating nodes", func() {
+			var (
+				node     *api.Node
+				networks map[string]struct{}
+				err      error
+
+				ingress, nw1, nw2 *api.Network
+			)
+
+			BeforeEach(func() {
+				ingress = &api.Network{
+					ID: "allocNodesIngress",
+					Spec: api.NetworkSpec{
+						Ingress: true,
+					},
+				}
+
+				nw1 = &api.Network{
+					ID: "allocNodesNw1",
+				}
+				nw2 = &api.Network{
+					ID: "allocNodesNw2",
+				}
+
+				initNetworks = append(initNetworks, ingress, nw1, nw2)
+
+				networks = map[string]struct{}{
+					"allocNodesIngress": {},
+					"allocNodesNw1":     {},
+					"allocNodesNw2":     {},
+				}
+
+				node = &api.Node{}
+			})
+
+			JustBeforeEach(func() {
+				err = a.AllocateNode(node, networks)
+			})
+			Context("when a new node is successfully allocated", func() {
+				BeforeEach(func() {
+					mockIpam.EXPECT().AllocateAttachment(
+						&api.NetworkAttachmentConfig{Target: "allocNodesIngress"},
+					).Return(
+						&api.NetworkAttachment{
+							Network: ingress,
+						}, nil,
+					)
+
+					mockIpam.EXPECT().AllocateAttachment(
+						&api.NetworkAttachmentConfig{Target: "allocNodesNw1"},
+					).Return(
+						&api.NetworkAttachment{
+							Network: nw1,
+						}, nil,
+					)
+
+					mockIpam.EXPECT().AllocateAttachment(
+						&api.NetworkAttachmentConfig{Target: "allocNodesNw2"},
+					).Return(
+						&api.NetworkAttachment{
+							Network: nw2,
+						}, nil,
+					)
+				})
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should include all of the networks", func() {
+					Expect(node.Attachments).To(ConsistOf(
+						&api.NetworkAttachment{
+							Network: ingress,
+						},
+						&api.NetworkAttachment{
+							Network: nw1,
+						},
+						&api.NetworkAttachment{
+							Network: nw2,
+						},
+					))
+				})
+			})
+
+			Context("when a node is already fully allocated", func() {
+				BeforeEach(func() {
+					node.Attachments = []*api.NetworkAttachment{
+						{
+							Network: nw1,
+						},
+						{
+							Network: nw2,
+						},
+						{
+							Network: ingress,
+						},
+					}
+				})
+				It("should return ErrAlreadyAllocated", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(WithTransform(errors.IsErrAlreadyAllocated, BeTrue()))
+				})
+			})
+
+			Context("when a network is added to an existing node", func() {
+				BeforeEach(func() {
+					node.Attachments = []*api.NetworkAttachment{
+						{
+							Network:              nw1,
+							DriverAttachmentOpts: map[string]string{"foo": "bar"},
+						},
+						{
+							Network:              ingress,
+							DriverAttachmentOpts: map[string]string{"baz": "bat"},
+						},
+					}
+					mockIpam.EXPECT().AllocateAttachment(
+						&api.NetworkAttachmentConfig{Target: "allocNodesNw2"},
+					).Return(
+						&api.NetworkAttachment{
+							Network: nw2,
+						}, nil,
+					)
+				})
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should include all of the networks", func() {
+					Expect(node.Attachments).To(ConsistOf(
+						&api.NetworkAttachment{
+							Network:              ingress,
+							DriverAttachmentOpts: map[string]string{"baz": "bat"},
+						},
+						&api.NetworkAttachment{
+							Network:              nw1,
+							DriverAttachmentOpts: map[string]string{"foo": "bar"},
+						},
+						&api.NetworkAttachment{
+							Network: nw2,
+						},
+					))
+				})
+			})
+
+			Context("when a network is removed from an existing node", func() {
+				BeforeEach(func() {
+					node.Attachments = []*api.NetworkAttachment{
+						{
+							Network:              nw1,
+							DriverAttachmentOpts: map[string]string{"foo": "bar"},
+						},
+						{
+							Network:              ingress,
+							DriverAttachmentOpts: map[string]string{"baz": "bat"},
+						},
+						{
+							Network: nw2,
+						},
+					}
+					delete(networks, nw2.ID)
+
+					mockIpam.EXPECT().DeallocateAttachment(
+						&api.NetworkAttachment{Network: nw2},
+					).Return(nil)
+				})
+				It("should not return an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should include all of the networks", func() {
+					Expect(node.Attachments).To(ConsistOf(
+						&api.NetworkAttachment{
+							Network:              ingress,
+							DriverAttachmentOpts: map[string]string{"baz": "bat"},
+						},
+						&api.NetworkAttachment{
+							Network:              nw1,
+							DriverAttachmentOpts: map[string]string{"foo": "bar"},
+						},
+					))
+				})
+			})
 		})
 	})
 

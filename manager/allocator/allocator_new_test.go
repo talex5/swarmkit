@@ -13,14 +13,15 @@ import (
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/manager/state"
 	"github.com/docker/swarmkit/manager/state/store"
+	// "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	// "github.com/sirupsen/logrus"
 )
 
 func init() {
 	// set artificially low retry interval for testing
 	retryInterval = 5 * time.Millisecond
+	// uncomment for SUPERLOGS
 	// logrus.SetLevel(logrus.DebugLevel)
 }
 
@@ -125,6 +126,7 @@ func TestNewAllocator(t *testing.T) {
 					Network: n1,
 				},
 			},
+			DesiredState: api.TaskStateRunning,
 		}
 		assert.NoError(t, store.CreateTask(tx, t1))
 
