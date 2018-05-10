@@ -593,7 +593,7 @@ var _ = Describe("port.Allocator", func() {
 		})
 	})
 
-	Describe("dyanmic port allocation", func() {
+	Describe("dynamic port allocation", func() {
 		Context("adding a port with no PublishPort specified", func() {
 			var (
 				spec     *api.EndpointSpec
@@ -804,6 +804,117 @@ var _ = Describe("port.Allocator", func() {
 					Expect(err).ToNot(HaveOccurred())
 					Expect(p).ToNot(BeNil())
 					Expect(p.IsNoop()).To(BeFalse())
+				})
+			})
+		})
+
+		Context("when adding a static port", func() {
+			var (
+				endpoint *api.Endpoint
+				spec     *api.EndpointSpec
+			)
+			BeforeEach(func() {
+				spec = &api.EndpointSpec{
+					Ports: []*api.PortConfig{
+						{
+							Protocol:    api.ProtocolTCP,
+							TargetPort:  80,
+							PublishMode: api.PublishModeIngress,
+						},
+					},
+				}
+				endpoint = &api.Endpoint{
+					Spec:  spec,
+					Ports: []*api.PortConfig{spec.Ports[0].Copy()},
+				}
+				endpoint.Ports[0].PublishedPort = 30000
+				pa.Restore([]*api.Endpoint{endpoint})
+			})
+			Context("which needs the old dynamic address", func() {
+				var (
+					newSpec *api.EndpointSpec
+					p       Proposal
+					e       error
+				)
+				BeforeEach(func() {
+					newSpec = &api.EndpointSpec{
+						Ports: []*api.PortConfig{
+							{
+								Protocol:    api.ProtocolTCP,
+								TargetPort:  80,
+								PublishMode: api.PublishModeIngress,
+							},
+							{
+								Protocol:      api.ProtocolTCP,
+								TargetPort:    443,
+								PublishedPort: 30000,
+								PublishMode:   api.PublishModeIngress,
+							},
+						},
+					}
+
+					p, e = pa.Allocate(endpoint, newSpec)
+				})
+				It("should succeed", func() {
+					Expect(e).ToNot(HaveOccurred())
+					Expect(p).ToNot(BeNil())
+					Expect(p.IsNoop()).ToNot(BeTrue())
+					Expect(p.Ports()).ToNot(BeEmpty())
+				})
+			})
+		})
+
+		Context("when adding a dynamic port", func() {
+			var (
+				endpoint *api.Endpoint
+				spec     *api.EndpointSpec
+			)
+			BeforeEach(func() {
+				spec = &api.EndpointSpec{
+					Ports: []*api.PortConfig{
+						{
+							Protocol:    api.ProtocolTCP,
+							TargetPort:  80,
+							PublishMode: api.PublishModeIngress,
+						},
+					},
+				}
+				endpoint = &api.Endpoint{
+					Spec:  spec,
+					Ports: []*api.PortConfig{spec.Ports[0].Copy()},
+				}
+				endpoint.Ports[0].PublishedPort = 30000
+				pa.Restore([]*api.Endpoint{endpoint})
+			})
+			Context("which is identical to the previous one", func() {
+				var (
+					newSpec *api.EndpointSpec
+					p       Proposal
+					e       error
+				)
+				BeforeEach(func() {
+					newSpec = &api.EndpointSpec{
+						Ports: []*api.PortConfig{
+							{
+								Protocol:    api.ProtocolTCP,
+								TargetPort:  80,
+								PublishMode: api.PublishModeIngress,
+							},
+							{
+								Protocol:    api.ProtocolTCP,
+								TargetPort:  80,
+								PublishMode: api.PublishModeIngress,
+							},
+						},
+					}
+
+					p, e = pa.Allocate(endpoint, newSpec)
+				})
+				It("should succeed", func() {
+					Expect(e).ToNot(HaveOccurred())
+					Expect(p).ToNot(BeNil())
+					Expect(p.IsNoop()).ToNot(BeTrue())
+					Expect(p.Ports()).ToNot(BeEmpty())
 				})
 			})
 		})
